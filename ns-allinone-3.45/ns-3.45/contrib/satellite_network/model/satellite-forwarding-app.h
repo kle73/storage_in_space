@@ -1,352 +1,388 @@
 #ifndef SATELLITE_FORWARDING_APP_H
 #define SATELLITE_FORWARDING_APP_H
 
+#include "constellation-config.h"
+#include "strategy-interfaces.h"
+
 #include "ns3/application.h"
+#include "ns3/header.h"
 #include "ns3/net-device.h"
 #include "ns3/packet.h"
-#include "ns3/address.h"
-#include "ns3/header.h"
 #include "ns3/random-variable-stream.h"
-#include "ns3/rng-seed-manager.h"
 
-#include "strategy-interfaces.h"
-// Routing strategies
-#include "routing/routing-ring-switch-walker-star.h"
-#include "routing/routing-ring-switch-walker-delta.h"
-
-// Content strategies
-#include "content/content-fill-double.h"
-
-#include "constellation-config.h"
-
-#include <memory>
-#include <vector>
+#include <cstdint>
 #include <deque>
-#include <queue>
-#include <unordered_map>
-#include <unordered_set>
+#include <functional>
+#include <memory>
 #include <string>
-#include <cstddef>
+#include <utility>
+#include <vector>
 
-// ── Strategy forward declarations ──────────────────────────────────────────
-namespace ns3 {
-
-class SatelliteForwardingApp;
-class RingSwitchScheduler;
-
-#define RTT_CORRECTION         0.2 // give n seconds extra time for the packet to come back
-#define MONITORE_POSITIONS     0   // logs satellite position data in regular intervals
-#define MONITORE_GENERAL       1   // enables queue and packet statistics
-#define MONITORE_PACKET        0   // logs every packet hop (threshold, send-everywhere) WILL SLOW DOWN SIMULATION SIGNIFICANTLY
-#define MONITORE_FLOW_BALANCE  0
-#define DEBUG_CONFIG           0   
-#define QUEUE_BUFFER           200
-#define QUEUE_BUFFER_RING      100000 // ring satellites receive a larger buffer because of the doppler effect
-#define GOSSIP_LOG_SAMPLE_RATE 10    // log first-reception for every N-th gossip broadcast (per origin)
-
-// ── Backpressure tuning (edit here to change algorithm behaviour) ─────────────
-// ISL links run at 80 Gbps — even 1 % rate reduction is ~800 Mbps, so keep gains small.
-#define BP_CHECK_INTERVAL_MS  2        // how often each satellite checks its queues (ms)
-#define BP_RELAY_MARGIN       0.05f    // relay signal if own queue > threshold*(1-this); default 5%
-#define BP_RADJ_GAIN          1.0f     // radj = gain * overshoot_fraction  (linear, 1%→1%)
-#define BP_MAX_RADJ           0.05f    // hard cap on rate reduction (5 % = 4 Gbps at 80 Gbps)
-#define BP_RADJ_EPSILON       0.002f   // min radj change needed to emit a new signal (0.2 %)
-
-// ── Ring-switch tuning ────────────────────────────────────────────────────────
-#define RING_SWITCH_P           3      // packet type sentinel for ring-switch control packets
-#define RING_SWITCH_DUMMY_P     4      // packet type for delay-dummy packets (silently dropped)
-#define RING_SWITCH_UP_TIME_S   50.0   // simulation time (s) to fire the ring-up switch
-#define RING_SWITCH_DOWN_TIME_S 50.0   // simulation time (s) to fire the ring-down switch
-
-#define TIME_TO_LIVE_MS (TIME_TO_LIVE * 1000)
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SatForwardHeader
-// ─────────────────────────────────────────────────────────────────────────────
-class SatForwardHeader : public Header
+namespace ns3
 {
-public:
-    static TypeId GetTypeId (void);
-    TypeId GetInstanceTypeId (void) const override;
 
-    void Serialize   (Buffer::Iterator start) const override;
-    uint32_t Deserialize (Buffer::Iterator start) override;
-    void Print       (std::ostream& os) const override;
-    uint32_t GetSerializedSize (void) const override { return 40; }
+/**
+ * Header of every packet sent by the storage applications (data copies,
+ * dummies and broadcasts). Wire size: 42 bytes.
+ */
+class SatPacketHeader : public Header
+{
+  public:
+    static TypeId GetTypeId();
+    TypeId GetInstanceTypeId() const override;
+    void Serialize(Buffer::Iterator start) const override;
+    uint32_t Deserialize(Buffer::Iterator start) override;
+    void Print(std::ostream& os) const override;
+    uint32_t GetSerializedSize() const override;
 
-    void     SetN        (uint32_t n)  { m_n       = n;  }
-    void     SetP        (uint32_t p)  { m_p       = p;  }
-    void     SetId       (uint32_t id) { m_id      = id; }
-    void     SetSat      (uint16_t s)  { m_sat     = s;  }
-    void     SetCameLeft (uint16_t cl) { m_cameLeft= cl; }
-    void     SetTime     (uint64_t t)  { m_time    = t;  }
-    void     SetRadj     (float r)     { m_radj    = r;  }
-    void     SetObjId    (uint32_t o)  { m_obj_id  = o;  }
-    void     SetFragId   (uint32_t f)  { m_frag_id = f;  }
-    void     SetDownEpoch (uint32_t e) { m_downEpoch = e; }
+    void SetId(uint32_t id) { m_id = id; }
+    void SetOrigin(uint16_t origin) { m_origin = origin; }
+    void SetCreationTimeMs(uint64_t timeMs) { m_creationTimeMs = timeMs; }
+    void SetTtl(uint64_t ttlS) { m_ttlS = ttlS; }
+    void SetDirection(uint16_t direction) { m_direction = direction; }
+    void SetEpoch(uint32_t epoch) { m_epoch = epoch; }
+    void SetObjectId(uint32_t objectId) { m_objectId = objectId; }
+    void SetFragmentId(uint32_t fragmentId) { m_fragmentId = fragmentId; }
+    void SetLastHop(uint32_t lastHop) { m_lastHop = lastHop; }
+    void SetDupCode(uint16_t dupCode) { m_dupCode = dupCode; }
 
-    int32_t  GetN        (void) const  { return m_n;       }
-    uint32_t GetP        (void) const  { return m_p;       }
-    uint32_t GetId       (void) const  { return m_id;      }
-    uint16_t GetSat      (void) const  { return m_sat;     }
-    uint16_t GetCameLeft (void) const  { return m_cameLeft;}
-    uint64_t GetTime     (void) const  { return m_time;    }
-    float    GetRadj     (void) const  { return m_radj;    }
-    uint32_t GetObjId    (void) const  { return m_obj_id;  }
-    uint32_t GetFragId   (void) const  { return m_frag_id; }
-    uint32_t GetDownEpoch (void) const { return m_downEpoch; }
+    /// Packet id, unique per origin satellite (shared by both copies of a fragment).
+    uint32_t GetId() const { return m_id; }
+    /// Satellite that created the packet and keeps its record.
+    uint16_t GetOrigin() const { return m_origin; }
+    uint64_t GetCreationTimeMs() const { return m_creationTimeMs; }
+    /// Time to live [s].
+    uint64_t GetTtl() const { return m_ttlS; }
+    /// One of direction_t.
+    uint16_t GetDirection() const { return m_direction; }
+    /// Ring-switch epoch of the ring the copy travels in.
+    uint32_t GetEpoch() const { return m_epoch; }
+    uint32_t GetObjectId() const { return m_objectId; }
+    uint32_t GetFragmentId() const { return m_fragmentId; }
+    /// Satellite that sent the packet (broadcast algorithms reuse it as hop counter).
+    uint32_t GetLastHop() const { return m_lastHop; }
+    /// > 0: the second copy of this fragment still has to be created
+    /// (broadcasts: 1 = sampled for the delivery statistics).
+    uint16_t GetDupCode() const { return m_dupCode; }
 
-private:
-    int32_t  m_n        {0};
-    uint32_t m_p        {0};
-    uint32_t m_id       {0};
-    uint32_t m_obj_id   {0};
-    uint32_t m_frag_id  {0};
-    uint16_t m_sat      {0};
-    uint16_t m_cameLeft {0};
-    uint64_t m_time     {0};
-    float    m_radj     {0.0f};
-    uint32_t m_downEpoch {0};
+  private:
+    uint32_t m_id{0};
+    uint16_t m_origin{0};
+    uint64_t m_creationTimeMs{0};
+    uint64_t m_ttlS{0};
+    uint16_t m_direction{0};
+    uint32_t m_epoch{0};
+    uint32_t m_objectId{0};
+    uint32_t m_fragmentId{0};
+    uint32_t m_lastHop{0};
+    uint16_t m_dupCode{0};
 };
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SatelliteForwardingApp
-// ─────────────────────────────────────────────────────────────────────────────
-class SatelliteForwardingApp : public Application
+/**
+ * Broadcast duplicate suppression: remembers the ids received from every
+ * origin in a sliding window of the newest ids. Ids older than the window
+ * count as seen (their broadcasts have expired).
+ */
+class BroadcastFilter
 {
-public:
-    static TypeId GetTypeId (void);
-    SatelliteForwardingApp ();
-    virtual ~SatelliteForwardingApp ();
+  public:
+    /// True if (origin, id) was seen before; otherwise it is marked as seen.
+    bool SeenBefore(uint16_t origin, uint32_t id);
 
-    void SetupWithDevices (uint32_t       satellitesPerOrbit,
-                           uint32_t       numSatellites,
-                           Ptr<NetDevice> devUp,
-                           Ptr<NetDevice> devDown,
-                           Ptr<NetDevice> devRight,
-                           Ptr<NetDevice> devLeft,
-                           bool           injectSeed,
-                           float          inclination,
-                           uint32_t       maxQueueFillLevel,
-                           std::string    routingAlgorithm,
-                           std::string    contentGeneration,
-                           std::string    statistics,
-                           bool           useBackpressure,
-                           ConstellationConfig topoConfig,
-                           uint32_t       trafficShare,
-                           uint32_t       runNumber);
-
-    // ── Accessors for strategies ──────────────────────────────────────────
-    Ptr<NetDevice> GetDevUp    () const { return m_devUp; }
-    Ptr<NetDevice> GetDevDown  () const { return m_devDown;  }
-    Ptr<NetDevice> GetDevRight () const { return m_devRight; }
-    Ptr<NetDevice> GetDevLeft  () const { return m_devLeft;  }
-    uint32_t GetSatsPerOrbit   () const { return m_satellitesPerOrbit; }
-    uint32_t GetNumSatellites  () const { return m_numSatellites; }
-    uint16_t GetSatId          () const { return sat_id; }
-    uint64_t GetIslQueueSize   () const { return m_islQueueSize; }
-    const ConstellationConfig& GetTopoConfig () const { return m_topoConfig; }
-    // Enlarge the ring queues of a ring member (isRingUp / isRingDown) now,
-    // as AdjustQueueBuffer does on its next 1 ms tick. For the routing, when a
-    // satellite becomes a ring member during a switch.
-    void GrowRingQueuesNow ();
-    uint64_t GetMaxIslQueueFillLevel() { return m_maxQueueFillLevel * (m_islQueueSize/100); }
-    bool     GetUseBackpressure() const { return m_useBackpressure; }
-
-    // Traffic counters — mutated by routing strategies
-    uint32_t m_recentBytesInDown  {1};
-    uint32_t m_recentBytesInLeft  {1};
-    uint32_t m_recentBytesOutUp   {1};
-    uint32_t m_recentBytesOutRight{1};
-
-    // Flow monitoring
-    uint32_t m_bytesSentUp {0};
-    uint32_t m_bytesSentDown {0};
-    uint32_t m_bytesSentLeft {0};
-    uint32_t m_bytesSentRight {0};
-    uint32_t m_bytesRecvUp {0};
-    uint32_t m_bytesRecvDown {0};
-    uint32_t m_bytesRecvLeft {0};
-    uint32_t m_bytesRecvRight {0};
-
-    uint32_t m_dropsUp {0};
-    uint32_t m_dropsRight {0};
-
-    uint32_t m_dropsFromDown {0};
-    uint32_t m_dropsFromLeft {0};
-
-    uint32_t m_runNumber{0};
-
-    // Packet tracking — mutated by content/routing strategies
-    struct PacketRecord {
-        double   created  {0.0};   // fixed at allocation; drives eviction
-        double   lastSeen {0.0};   // updated on each return; <=0 means "resent"
-        double   lastSeenUp   {0.0};   // last return of the UP copy   (0 = none yet), RTT only
-        double   lastSeenDown {0.0};   // last return of the DOWN copy (0 = none yet), RTT only
+  private:
+    struct Window
+    {
+        uint32_t base{0}; ///< lowest id in the window, multiple of 64
+        bool initialized{false};
+        std::vector<uint64_t> bits;
     };
 
-    // RTT statistics. The routing calls RecordReturn whenever an own UP or DOWN
-    // copy is back at its origin. RTT = time between two returns of the SAME
-    // copy (UP and DOWN tracked separately); CheckPackets writes the mean over
-    // all returns since the previous stats line as curr_rtt.
-    void          RecordReturn (PacketRecord* rec, bool up, double now);
+    std::vector<Window> m_windows; ///< indexed by origin
+};
 
-    // Allocates the next id and its record together, so the two can never
-    // drift apart 
-    uint32_t      AllocatePacketId ();
-    PacketRecord* GetRecord (uint32_t id); // nullptr if evicted
-    size_t        GetNumLiveRecords () const { return m_records.size (); } // own packets not yet evicted (TTL)
-    void          EvictExpiredRecords ();
-    uint64_t num_stale_records {0};        // arrivals past the horizon: should stay 0
+/**
+ * Parameters of one satellite application (see SatelliteForwardingApp::Setup).
+ */
+struct SatelliteForwardingAppParams
+{
+    uint32_t satellitesPerOrbit{0};
+    uint32_t numSatellites{0};
+    Ptr<NetDevice> devUp;    ///< next satellite in the orbit
+    Ptr<NetDevice> devDown;  ///< previous satellite in the orbit
+    Ptr<NetDevice> devRight; ///< satellite in the next orbit
+    Ptr<NetDevice> devLeft;  ///< satellite in the previous orbit
+    std::string routingAlgorithm;  ///< ring-switch-walker-star | ring-switch-walker-delta
+    std::string contentGeneration; ///< fill-double | broadcast
+    std::string broadcastAlgorithm{"prune"}; ///< walker-delta only, see RoutingRingSwitchDelta
+    ConstellationConfig constellation;
+    uint32_t maxQueueFillLevel{100}; ///< fill level of the storage queues, percent of the ISL queue size
+    uint32_t objectSize{10};         ///< packets per object
+    uint64_t objectTtl{10000};       ///< time to live of stored objects [s]
+    uint32_t runNumber{0};
+};
 
-    // Packet stats
-    std::queue<uint32_t> lost_packets; 
-    std::unordered_set<uint32_t> lost_packets_lookup;
-    uint32_t current_packet_id  {0};
-    double   curr_rtt           {10.0};  // mean RTT of the last stats interval (10.0 = none measured yet)
-    double   m_rttSum           {0.0};   // RTTs measured since the last stats line
-    uint64_t m_rttCount         {0};
-    uint32_t num_dropped_packets{0};
-    double   current_circulation_rate{1.0};
+/**
+ * Application running on every satellite.
+ *
+ * It owns the four ISL devices, creates the routing and the content strategy
+ * and provides what both share: packet forwarding, queue sizes, the storage
+ * levels, the ring roles of the satellite, the records of its own packets, the
+ * statistics and the output files.
+ *
+ * Storage levels: the storage queue of a direction is the data queue of devUp
+ * (UP copies) or of devDown (DOWN copies). Its level becomes active, at the
+ * fill level, the first time the queue is full. From then on the routing tops
+ * the queue up to the level with dummy packets before it enqueues a copy of
+ * that direction, so that the queueing delay stays constant whatever the
+ * amount of stored data. A copy whose time to live has expired is removed by
+ * its origin when it passes there; if a new object is waiting, a copy of the
+ * new object takes its place in the same stream (ReplaceExpiredOwnCopy).
+ * Otherwise the level of the origin is lowered by one, which leaves room for
+ * a new copy later; every copy stored through AdmitObject raises the level
+ * again, and new copies are only admitted while the level is below the fill
+ * level. Once all levels are active, the amount of stored data therefore
+ * stays constant: expired copies are replaced by new ones, not by dummies.
+ */
+class SatelliteForwardingApp : public Application
+{
+  public:
+    static constexpr uint16_t kProtocolData = 0x0800;
+    static constexpr uint16_t kProtocolBroadcast = 0x0801;
+    static constexpr uint32_t kPayloadSize = 1500; ///< bytes per packet (without header)
 
-    // Object tracking
-    std::deque<std::pair<uint32_t,uint32_t>> pending_objects;
-    uint32_t m_numPendingPackets{0};
-    bool     stop_generating_objects{false};
-    uint32_t current_obj_id{0};
-    uint32_t obj_size{15000}; // CHANGE -> {10, 100, 666} packets
+    /// Extra queue space above the ISL queue size for every queue.
+    static constexpr uint64_t kQueueHeadroom = 200;
+    /// Extra queue space of the ring queues (Doppler backlog).
+    static constexpr uint64_t kRingQueueHeadroom = 100000;
 
-    // Retry queue used by routing strategies
-    std::queue<std::pair<Ptr<NetDevice>, Ptr<Packet>>> m_retryQueue;
-    bool m_retryScheduled{false};
+    /// Copies of a new object that may be stored (see AdmitObject).
+    enum class Admission
+    {
+        NONE,      ///< none: the object has to wait
+        UP_ONLY,   ///< UP copy only; the routing creates the DOWN copy later
+        DOWN_ONLY, ///< DOWN copy only; the routing creates the UP copy later
+        BOTH,
+    };
 
-    static constexpr uint16_t PROTO           = 0x0800;
-    static constexpr uint16_t PROTO_BROADCAST = 0x0801;
-    static constexpr uint32_t maxPayloadSize  = 1500;
+    /// Writes the next waiting copy of `direction` into `header` (identity
+    /// fields only); returns false if no copy is waiting.
+    using ReplacementSource = std::function<bool(direction_t direction, SatPacketHeader& header)>;
 
-    // Shared helpers called by strategies
-    void ForwardPacket (Ptr<NetDevice> outDev, Ptr<Packet> pkt, bool isUp);
-    void ForwardPacket (Ptr<NetDevice> outDev, Ptr<Packet> pkt, bool isUp,
-                        const uint16_t proto);
+    /// Record of a packet created by this satellite (both copies share it).
+    struct PacketRecord
+    {
+        double created{0.0};      ///< creation time [s]
+        double lastSeen{0.0};     ///< last time any copy passed this satellite [s]
+        double lastSeenUp{0.0};   ///< last pass of the UP copy (0: none yet) [s]
+        double lastSeenDown{0.0}; ///< last pass of the DOWN copy (0: none yet) [s]
+    };
 
-    // Monitoring
-    void MonitorQueues         ();
-    void CheckPackets          ();
-    void ComputeDebugStatistics();
-    void MonitoreSatellitePositions();
-    void MonitorFlowBalance();
+    static TypeId GetTypeId();
+    SatelliteForwardingApp();
+    ~SatelliteForwardingApp() override;
 
-    // ── Output files ──────────────────────────────────────────────────────────
-    // Every statistics / debug file is written below ONE output folder. The
-    // main program sets it once, before the simulation starts
-    // (storage_in_space --outDir=<folder>). Default: "mysim_results", relative
-    // to the folder the simulation runs in (a relative folder is resolved
-    // against the working directory, an absolute one is used as is).
-    // Below it the layout is fixed, e.g. queue_stats/experiment4/....
-    static void        SetOutputDir (const std::string& dir);
-    static std::string GetOutputDir ();
-    // "<output folder>/<relPath>"; missing parent folders are created.
-    static std::string OutputPath   (const std::string& relPath);
-    // Same, written into one of the fixed-size filename buffers below; stops
-    // the simulation with a clear message if the path does not fit.
-    static void        OutputPath   (const std::string& relPath, char* dst, std::size_t dstSize);
+    /// Must be called once before the application starts.
+    void Setup(const SatelliteForwardingAppParams& params);
 
-    // File paths (set once in StartApplication via OutputPath, read by stats)
-    char filename_queue_stats[512];
-    char filename_packet_stats[512];
-    char filename_debug[512];
-    char filename_positions[512];
-    char filename_flow[512];
-    char filename_reassemble[512];
-    char filename_broadcast_stats[512];
-    char filename_obj_inject[512];
-    char filename_obj_dup[512];
+    // ── Output files ─────────────────────────────────────────────────────────
+    /// Output folder of all applications (default "mysim_results", relative to
+    /// the working directory).
+    static void SetOutputDir(const std::string& dir);
+    static std::string GetOutputDir();
+    /// "<output folder>/<relPath>"; missing parent folders are created.
+    static std::string OutputPath(const std::string& relPath);
 
-    Ptr<UniformRandomVariable> uniform_rnd;
-    bool isCurrentlyEquator{false};
+    // ── Topology and devices ─────────────────────────────────────────────────
+    Ptr<NetDevice> GetDevUp() const { return m_devUp; }
+    Ptr<NetDevice> GetDevDown() const { return m_devDown; }
+    Ptr<NetDevice> GetDevRight() const { return m_devRight; }
+    Ptr<NetDevice> GetDevLeft() const { return m_devLeft; }
+    uint16_t GetSatId() const { return m_satId; }
+    uint32_t GetSatsPerOrbit() const { return m_satsPerOrbit; }
+    uint32_t GetNumSatellites() const { return m_numSatellites; }
+    uint32_t GetNumOrbits() const { return m_numOrbits; }
+    const ConstellationConfig& GetConstellationConfig() const { return m_constellation; }
+    Ptr<UniformRandomVariable> GetRandom() const { return m_random; }
 
-    bool isSeamLeft {false};
-    bool isSeamRight{false};
-    bool isRingUp   {false};
-    bool isRingDown {false};
-    // Set by the routing: no new copies (admission, second copies) into the
-    // UP / DOWN queue of this satellite. Used by the Walker-Delta routing for
-    // the exit of the kink orbit, whose UP / DOWN link carries no ring traffic
-    // (copies sent there would merge with the ring stream one hop later).
-    bool m_noInjectUp   {false};
-    bool m_noInjectDown {false};
+    // ── Queues ───────────────────────────────────────────────────────────────
+    /// ISL queue size [packets] (without headroom).
+    uint64_t GetIslQueueSize() const { return m_islQueueSize; }
+    /// Fill level of the storage queues [packets].
+    uint64_t GetFillLevel() const { return m_maxQueueFillLevel * m_islQueueSize / 100; }
+    /// Number of packets in the data queue of `device`.
+    static uint64_t GetQueueOccupancy(Ptr<NetDevice> device);
+    /// Gives the ring queues of a new ring member their enlarged limit right
+    /// away (AdjustQueueLimits does it on its next tick).
+    void GrowRingQueues();
+    /// Sends `packet` on `outDev` if the queue of that protocol has space,
+    /// otherwise counts it as dropped.
+    void ForwardPacket(Ptr<NetDevice> outDev, Ptr<Packet> packet, uint16_t protocol = kProtocolData);
+    /// Fills the data queue of `device` with dummy packets up to `level`
+    /// packets. Dummies are dropped by the next satellite: they only add
+    /// queueing delay. Nothing is sent across the seam.
+    void FillWithDummies(Ptr<NetDevice> device, uint64_t level);
+    /// Devices on which this satellite sends a new broadcast (chosen by the routing).
+    std::vector<Ptr<NetDevice>> GetBroadcastFirstHops() const;
 
-    // Ring-switch: set for the two satellites that bracket the next ring position.
-    // isNewSeamRight* = initiator satellite (sends first switch packet, becomes new seamRight).
-    // isNewSeamLeft*  = terminus satellite (last in the wave, becomes new seamLeft).
-    bool isNewSeamRightUp  {false};
-    bool isNewSeamLeftUp   {false};
-    bool isNewSeamRightDown{false};
-    bool isNewSeamLeftDown {false};
+    // ── Storage levels ───────────────────────────────────────────────────────
+    bool IsLevelActive(direction_t direction) const;
+    /// Called by the routing before it enqueues a copy of `direction` into the
+    /// storage queue of `direction`: activates the level once the queue is
+    /// full and tops the queue up to the level with dummies.
+    void RegulateStorageQueue(direction_t direction);
+    /// Decides which copies of a new object of `numPackets` packets may be
+    /// stored now and adds them to the levels. Once both levels are active,
+    /// objects are only stored complete.
+    Admission AdmitObject(uint32_t numPackets);
+    /// Handles a copy of this satellite whose time to live has expired (not
+    /// around a ring switch): a waiting copy of the same direction takes its
+    /// place (the header is rewritten and the copy is forwarded as usual),
+    /// otherwise the copy is deleted and the level lowered. Returns true if
+    /// the copy is deleted, i.e. must not be forwarded.
+    bool ReplaceExpiredOwnCopy(SatPacketHeader& header);
+    /// Source of the copies that replace expired ones (set by the content strategy).
+    void SetReplacementSource(ReplacementSource source) { m_replacementSource = std::move(source); }
+    /// A fragment that was stored as a single copy passes this satellite:
+    /// stores the missing copy in `direction` with `epoch` if the storage queue
+    /// of `direction` is still filling. Returns true if the copy was created.
+    bool CreateSecondCopy(direction_t direction, const SatPacketHeader& header, uint32_t epoch);
+    /// True if the time to live of the packet has expired.
+    static bool IsExpired(const SatPacketHeader& header);
 
-    bool isGateway{false};
+    // ── Ring roles (set by the routing) ──────────────────────────────────────
+    bool IsRingUp() const { return m_ringUp; }
+    bool IsRingDown() const { return m_ringDown; }
+    void SetRingUp(bool member) { m_ringUp = member; }
+    void SetRingDown(bool member) { m_ringDown = member; }
+    /// Satellite next to the seam (Walker-Star): its left / right ISL crosses it.
+    bool IsSeamLeft() const { return m_seamLeft; }
+    bool IsSeamRight() const { return m_seamRight; }
+    /// No new copies may be stored in the queue of `direction` (UP / DOWN).
+    bool IsInsertionBlocked(direction_t direction) const;
+    void SetInsertionBlocked(direction_t direction, bool blocked);
+    /// Epoch new copies of `direction` are created with.
+    uint32_t GetInsertionEpoch(direction_t direction) const;
+    void SetInsertionEpoch(direction_t direction, uint32_t epoch);
 
-    // Pointer wired by RingSwitchScheduler after all apps are created.
-    // Null when the scheduler is not in use (static timing or MPI mode).
-    RingSwitchScheduler* m_ringScheduler {nullptr};
+    // ── Ring switches ────────────────────────────────────────────────────────
+    /// Announces a ring switch at `time` [s] (RingSwitchScheduler, before the
+    /// simulation starts); used for the switch guard.
+    void AddRingSwitchTime(double time) { m_switchTimes.push_back(time); }
+    /// Called by RingSwitchScheduler on the satellite that starts a switch.
+    void TriggerRingUpSwitch();
+    void TriggerRingDownSwitch();
+    /// True from shortly before until the queues have settled after a ring
+    /// switch: no copies are stored or deleted and no queue is shrunk.
+    bool IsInSwitchGuard() const;
 
-    std::vector<double> switch_times;
+    // ── Objects and own packets ──────────────────────────────────────────────
+    uint32_t GetObjectSize() const { return m_objectSize; }
+    uint64_t GetObjectTtl() const { return m_objectTtl; }
+    uint32_t AllocateObjectId() { return m_nextObjectId++; }
+    /// Allocates the next packet id together with its record.
+    uint32_t AllocatePacketId();
+    uint32_t GetNumAllocatedPacketIds() const { return m_nextPacketId; }
+    /// Record of packet `id`, nullptr if it has been evicted.
+    PacketRecord* GetRecord(uint32_t id);
+    /// A copy of one of this satellite's packets passed it: refresh its record
+    /// and measure the round-trip time of that copy.
+    void RecordReturn(PacketRecord* record, direction_t direction);
 
-    // Trampoline called by RingSwitchScheduler to fire a ring switch on this satellite.
-    void TriggerRingUpSwitch   ();
-    void TriggerRingDownSwitch ();
+    // ── Statistics and event logs ────────────────────────────────────────────
+    /// A packet arrived on a port without routing rule (counted as dropped).
+    void LogUnroutable(int code, uint32_t lastHop);
+    /// mode: 0 both copies, 1 UP copy only, 2 DOWN copy only.
+    void LogObjectInsertion(uint32_t objectId, uint32_t numFragments, int mode);
+    void LogDuplication(uint16_t origin, uint32_t objectId, uint32_t fragmentId);
+    void LogReassembly(uint16_t dupCode, uint16_t origin, uint32_t id);
+    void LogBroadcast(bool isSender, uint16_t origin, uint32_t id);
 
-    void AdjustQueueBuffer(void);
+  private:
+    /// Level of one storage queue.
+    struct StorageLevel
+    {
+        bool active{false};
+        int64_t level{0}; ///< the queue is topped up to this many packets (if > 0)
+    };
 
-    float m_inclination {86.4};
-    uint32_t       m_numOrbits         {0};
-    uint32_t m_maxQueueFillLevel {1};
+    void StartApplication() override;
 
-    uint32_t num_final_drops {0};
+    bool ReceiveFromDevice(Ptr<NetDevice> device,
+                           Ptr<const Packet> packet,
+                           uint16_t protocol,
+                           const Address& sender);
 
-    uint32_t m_currUpEpoch{0};
-    uint32_t m_currDownEpoch{0};
+    /// Periodic: ring members get enlarged queues, other queues return to the
+    /// normal limit once drained.
+    void AdjustQueueLimits();
+    Ptr<NetDevice> GetStorageDevice(direction_t direction) const;
+    StorageLevel& GetStorageLevel(direction_t direction);
+    const StorageLevel& GetStorageLevel(direction_t direction) const;
+    /// Activates the level of `direction` once no object fits into its queue.
+    void ActivateLevelIfFull(direction_t direction);
+    /// Space for new copies in the storage queue of `direction` [packets].
+    uint64_t GetStorageSpace(direction_t direction) const;
+    void EvictExpiredRecords();
+    void WriteQueueStatistics();
+    void WritePacketStatistics();
 
-private:
-    virtual void StartApplication (void) override;
-    virtual void StopApplication  (void) override;
+    std::unique_ptr<RoutingStrategy> m_routing;
+    std::unique_ptr<ContentStrategy> m_content;
+    Ptr<UniformRandomVariable> m_random;
 
-    void  ResetPacketStatistics (void);
+    // topology
+    uint16_t m_satId{0};
+    uint32_t m_satsPerOrbit{0};
+    uint32_t m_numSatellites{0};
+    uint32_t m_numOrbits{0};
+    ConstellationConfig m_constellation;
+    Ptr<NetDevice> m_devUp;
+    Ptr<NetDevice> m_devDown;
+    Ptr<NetDevice> m_devRight;
+    Ptr<NetDevice> m_devLeft;
 
-    void SendLostPackets(void);
-
-
-    bool DispatchReceive (Ptr<NetDevice>    device,
-                          Ptr<const Packet> packet,
-                          uint16_t          protocol,
-                          const Address&    sender);
-
-
-    // Strategy instances
-    std::unique_ptr<RoutingStrategy>  m_routing;
-    std::unique_ptr<ContentStrategy>  m_content;
-    // std::unique_ptr<Statistics>       m_statistics;
-
-    // Devices
-    uint32_t       m_satellitesPerOrbit{0};
-    uint32_t       m_numSatellites     {0};
-    Ptr<NetDevice> m_devUp             {nullptr};
-    Ptr<NetDevice> m_devDown           {nullptr};
-    Ptr<NetDevice> m_devRight          {nullptr};
-    Ptr<NetDevice> m_devLeft           {nullptr};
-    bool                m_injectSeed        {false};
-    bool                m_useBackpressure   {false};
-    ConstellationConfig m_topoConfig        {};
-    uint32_t m_trafficShare {2};
-
-    uint16_t sat_id{0};
+    // queues
     uint64_t m_islQueueSize{0};
+    uint32_t m_maxQueueFillLevel{100};
+    StorageLevel m_storageLevels[2]; ///< UP, DOWN
+    ReplacementSource m_replacementSource;
 
-    std::deque<PacketRecord> m_records;
-    uint32_t m_baseId {0};            // id of m_records.front()
+    // ring roles
+    bool m_ringUp{false};
+    bool m_ringDown{false};
+    bool m_seamLeft{false};
+    bool m_seamRight{false};
+    bool m_insertionBlocked[2]{false, false};
+    uint32_t m_insertionEpoch[2]{0, 0};
+    std::vector<double> m_switchTimes;
+
+    // objects and own packets
+    uint32_t m_objectSize{10};
+    uint64_t m_objectTtl{10000};
+    uint32_t m_nextObjectId{0};
+    uint32_t m_nextPacketId{0};
+    std::deque<PacketRecord> m_records; ///< records of ids m_firstRecordId, m_firstRecordId + 1, ...
+    uint32_t m_firstRecordId{0};
+
+    // statistics
+    uint32_t m_runNumber{0};
+    uint32_t m_numDropped{0};
+    uint64_t m_numStaleRecords{0}; ///< copies that arrived after their record was evicted
+    double m_rttSum{0.0};          ///< round-trip times measured since the last statistics line
+    uint64_t m_rttCount{0};
+    double m_meanRtt{10.0}; ///< mean round-trip time of the last interval (10.0: none measured yet)
+    double m_maxRtt{0.0};   ///< longest round-trip time measured so far
+
+    // output files
+    std::string m_queueStatsFile;
+    std::string m_packetStatsFile;
+    std::string m_reassemblyFile;
+    std::string m_broadcastFile;
+    std::string m_insertionFile;
+    std::string m_duplicationFile;
+    std::string m_unroutableFile;
 };
 
 } // namespace ns3
+
 #endif // SATELLITE_FORWARDING_APP_H

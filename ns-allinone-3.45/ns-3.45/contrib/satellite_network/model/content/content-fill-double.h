@@ -2,102 +2,88 @@
 #define CONTENT_FILL_DOUBLE_H
 
 #include "../strategy-interfaces.h"
-#include "../routing/routing-ring-switch-walker-star.h"
 
+#include <cstdint>
 #include <deque>
-#include <utility>
 
-#define CHECK_BROADCAST_TIME 0
-#define GENERATION_START_TIME 0 // in seconds
-// no new packets in [switch time - 1 s, switch time + SWITCH_SAFETY_TIMEOUT)
-#define SWITCH_SAFETY_TIMEOUT 3 // in seconds
-#define TIME_TO_LIVE 10000      // [s]; packets older than this are dropped
+namespace ns3
+{
 
-// ── Periodic storage (fixed budget) ──────────────────────────────────────────
-// The queues are filled during an initial fill phase [0, STORAGE_FILL_PHASE_END_S)
-// (admission rule: an object enters a queue only while that queue is below the
-// fill level). Afterwards the stored amount is fixed: every satellite keeps at
-// most as many own packets alive as it had when its budget was frozen (with a
-// finite TTL, expired packets are replaced up to that budget). Without the
-// fixed budget every ring switch increased the stored amount: a switch empties
-// some queues and builds backlogs elsewhere; admission refilled the emptied
-// queues while the backlogs never drain in a saturated loop.
-// Also used for:
-//   - second copies (RoutingRingSwitchStar::DuplicatePacket) stop here;
-//   - each satellite records its steady DOWN queue level here, and the DOWN
-//     queue regulation starts (RoutingRingSwitchStar [DOWN-REGULATION]; the
-//     routing file has its own copy of this value, keep both equal).
-#define STORAGE_FILL_PHASE_END_S 20.0
-// The budget is frozen only once the FIRST DOWN ring switch has settled
-// (FIRST_DOWN_SWITCH_SETTLE_S after the satellite has seen the new DOWN epoch).
-// The initial DOWN ring has run for less than a full switch period when the
-// first switch happens, i.e. it has accumulated less Doppler backlog than the
-// switch gives back (the new ring is longer); the first switch therefore
-// over-drains a few DOWN queues once. Admission refills them before the budget
-// is frozen, so all later switches start from the steady state.
-// (Only meaningful if the first DOWN switch comes before the first UP switch,
-// as for Iridium; set to 0 to freeze at STORAGE_FILL_PHASE_END_S.)
-// Not applied to closed rings (Walker-Delta, ConstellationConfig::closedRing):
-// their budget is frozen at STORAGE_FILL_PHASE_END_S. A Walker-Delta DOWN
-// switch takes one full ring revolution (several seconds, longer than the
-// switch blackout); admission during it would fill the transient gaps of the
-// switch and overflow queues when they close.
-// Second copies (DuplicatePacket) still stop at STORAGE_FILL_PHASE_END_S.
-#define FREEZE_AFTER_FIRST_DOWN_SWITCH 1
-#define FIRST_DOWN_SWITCH_SETTLE_S     10.0
-
-namespace ns3 {
-
-
+class SatPacketHeader;
 
 /**
- * Continuous object generation with two copies per object (writeup 2.2.2).
+ * Object generation and insertion.
  *
- * GenerateObject() runs every 2-12 us; with probability 1/N (N = number of
- *   satellites) it appends a new object (obj_size / maxPayloadSize packets) to
- *   pending_objects. Nothing is queued while the frozen budget is exhausted.
- * SendObject() runs every 10 us (20 us / 1 ms when it has to wait) and inserts
- *   the first pending object:
- *     - both queues below the fill level: UP copy and DOWN copy (dup_code 0)
- *     - only one queue below the fill level: that copy only, flagged
- *       (dup_code 1) so that DuplicatePacket can add the other copy later
- *       (fill phase only)
- *     - neither: wait.
- *   No insertion in the switch blackout window around every ring switch, and
- *   none beyond the frozen storage budget (see STORAGE_FILL_PHASE_END_S,
- *   FREEZE_AFTER_FIRST_DOWN_SWITCH).
+ * Every satellite generates objects of GetObjectSize() packets at random
+ * times; they wait in a pending list until they can be stored. In STORAGE
+ * mode every object is stored as two copies, an UP and a DOWN copy:
+ *  - inserted into the UP and DOWN queue of the satellite whenever the storage
+ *    levels admit it (SatelliteForwardingApp::AdmitObject). If only one of the
+ *    two queues has room, that copy is inserted alone and flagged (dup code
+ *    1), and the routing creates the second copy later at a satellite whose
+ *    queue is still filling;
+ *  - or copy by copy in place of expired copies of this satellite
+ *    (TakeReplacementCopy), UP copies in place of UP copies and DOWN copies in
+ *    place of DOWN copies.
+ * In BROADCAST mode every object is sent to all satellites instead; the
+ * routing chooses the first hops and forwards the broadcast.
+ *
+ * No object is inserted around a ring switch.
  */
 class ContentFillDouble : public ContentStrategy
 {
-public:
-    void Generate () override;
+  public:
+    enum class Mode
+    {
+        STORAGE,
+        BROADCAST
+    };
 
-private:
+    explicit ContentFillDouble(Mode mode);
 
+    void Init(SatelliteForwardingApp* app) override;
+    void Generate() override;
 
-    Ptr<Packet> MakeFragment (uint32_t obj_id, uint32_t frag_id,
-                                 uint16_t direction,
-                                 uint32_t epoch,
-                                 uint16_t dup_code,
-                                 uint32_t id);
-    uint32_t m_broadcastId {0};
+  private:
+    struct PendingObject
+    {
+        uint32_t id;
+        uint32_t numPackets;
+    };
 
-    void GenerateObject ();
-    void SendObject     ();
+    /// Object that is stored copy by copy in place of expired copies.
+    struct ReplacingObject
+    {
+        uint32_t id;
+        uint32_t numPackets;
+        uint32_t firstPacketId;
+        uint64_t creationTimeMs;
+        uint32_t numStored[2]; ///< copies stored so far, UP and DOWN
+    };
 
-    void GenerateBroadcastPacket (uint32_t obj_id, uint32_t num_packets, uint32_t curr_id);
+    void GenerateObject();
+    void SendObject();
+    /// Inserts the copies of `object` the storage levels admit; returns false
+    /// if the object has to wait.
+    bool InsertObject(const PendingObject& object);
+    void BroadcastObject(const PendingObject& object);
+    /// Writes the next copy of `direction` of the objects being stored in
+    /// place of expired copies into `header`; false if none is waiting.
+    bool TakeReplacementCopy(direction_t direction, SatPacketHeader& header);
+    Ptr<Packet> MakeFragment(uint32_t objectId,
+                             uint32_t fragmentId,
+                             direction_t direction,
+                             uint32_t epoch,
+                             uint16_t dupCode,
+                             uint32_t id) const;
 
-    std::deque<std::pair<uint32_t,uint32_t>> pending_objects;
-    uint32_t m_numPendingPackets{0};
-
-    // fixed storage budget = number of own live records (PacketRecords) when the
-    // budget was frozen (STORAGE_FILL_PHASE_END_S / FREEZE_AFTER_FIRST_DOWN_SWITCH)
-    uint64_t m_storageBudget {0};
-    bool     m_budgetFrozen  {false};
-    double   m_firstDownSwitchSeenAt {-1.0};   // time this satellite first saw DOWN epoch >= 1
-
-    char filename_content_stats[512];
+    Mode m_mode;
+    std::deque<PendingObject> m_pending;
+    std::deque<ReplacingObject> m_replacing;
+    uint64_t m_numPendingPackets{0};
+    bool m_generationStopped{false};
 };
 
 } // namespace ns3
+
 #endif // CONTENT_FILL_DOUBLE_H

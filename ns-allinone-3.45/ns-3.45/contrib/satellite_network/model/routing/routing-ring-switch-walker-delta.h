@@ -1,177 +1,125 @@
-#ifndef ROUTING_RING_SWITCH_DELTA_H
-#define ROUTING_RING_SWITCH_DELTA_H
+#ifndef ROUTING_RING_SWITCH_WALKER_DELTA_H
+#define ROUTING_RING_SWITCH_WALKER_DELTA_H
 
+#include "../satellite-forwarding-app.h"
 #include "../strategy-interfaces.h"
-#include <unordered_set>
+
+#include <array>
 #include <cstdint>
-#include "ns3/header.h"
+#include <memory>
+#include <string>
+#include <vector>
 
-namespace ns3 {
-
-// Routing Switxh Header Definition
-class RingSwitchDeltaHeader : public Header
+namespace ns3
 {
-public:
-    static TypeId GetTypeId (void);
-    TypeId GetInstanceTypeId (void) const override;
-
-    void Serialize   (Buffer::Iterator start) const override;
-    uint32_t Deserialize (Buffer::Iterator start) override;
-    void Print       (std::ostream& os) const override;
-    uint32_t GetSerializedSize (void) const override { return 42; }
-
-    void     SetId          (uint32_t id)   { m_id      = id; }
-    void     SetSat         (uint16_t s)    { m_sat     = s;  }
-    void     SetTime        (uint64_t t)    { m_time    = t;  }
-    void     SetTTL         (uint64_t ttl)  { m_ttl     = ttl;  }
-    void     SetDirection   (uint16_t d)    { m_direction = d;  }
-    void     SetEpoch       (uint32_t e)    { m_epoch     = e; }
-    void     SetObjId       (uint32_t oid)  { m_obj_id  = oid; }
-    void     SetFragId      (uint32_t fid)  { m_frag_id = fid; }
-    void     SetLastHop     (uint32_t lh)   { m_last_hop = lh; }
-    void     SetDupCode     (uint16_t dc)   { m_dup_code = dc; }
-
-    uint32_t GetId       (void) const  { return m_id;      }
-    uint16_t GetSat      (void) const  { return m_sat;     }
-    uint64_t GetTime     (void) const  { return m_time;    }
-    uint64_t GetTTL      (void) const  { return m_ttl;    }
-    uint16_t GetDirection(void) const  { return m_direction;}
-    uint32_t GetEpoch    (void) const  { return m_epoch; }
-    uint32_t GetObjId    (void) const  { return m_obj_id;  }
-    uint32_t GetFragId   (void) const  { return m_frag_id; }
-    uint32_t GetLastHop  (void) const  { return m_last_hop; }
-    uint16_t GetDupCode  (void)  const  { return m_dup_code; } 
-
-private:
-    uint32_t m_id       {0};
-    uint16_t m_sat      {0};
-    uint64_t m_time     {0};
-    uint64_t m_ttl      {0};
-    uint16_t m_direction{0};
-    uint32_t m_epoch    {0};
-
-    uint32_t m_obj_id   {0};
-    uint32_t m_frag_id  {0};
-
-    uint32_t m_last_hop {0};
-    uint16_t m_dup_code   {0};
-
-};
-
 
 /**
- * Ring routing with periodic ring relocation for Walker-Delta constellations
- * (e.g. Starlink). No seam: both rings are closed loops around the globe.
+ * Broadcast algorithm of the Walker-Delta routing (one object per satellite).
  *
- * Every copy goes once around its orbit (UP copies upwards, DOWN copies
- * downwards) and leaves the orbit at the orbit's EXIT satellite: UP exits
- * forward to the right, DOWN exits forward to the left. The exits of all
- * orbits form the ring row. Because the inter-orbit ISLs of the last and the
- * first orbit are shifted by one position (Walker phasing), one orbit per ring
- * has its entry one position away from its exit (kink orbit).
- *
- * Ring switch (RingSwitchScheduler -> InitiateRingUpSwitch() /
- * InitiateRingDownSwitch()), all exits move down by one position per switch:
- *   UP  : role wave started by the new exit of the UP kink orbit; a satellite
- *         takes its role for a new epoch when it first sees it.
- *   DOWN: per-copy routing, every DOWN copy exits at the exit of the epoch it
- *         carries; the switch is started by the new exit of the DOWN kink
- *         orbit, which gives the new epoch to the copies entering there.
- * Full description: overview at the top of routing-ring-switch-walker-delta.cc.
+ * The routing drops duplicates (BroadcastFilter) and hands every broadcast to
+ * the algorithm selected with --broadcastAlgorithm. A new algorithm derives
+ * from this class and is added to the list of algorithms at the top of
+ * routing-ring-switch-walker-delta.cc.
  */
-class RoutingRingSwitchDelta: public RoutingStrategy
+class DeltaBroadcastAlgorithm
 {
-public:
-    bool OnReceive (Ptr<NetDevice>    device,
-                    Ptr<const Packet> packet,
-                    uint16_t          protocol,
-                    const Address&    sender) override;
+  public:
+    virtual ~DeltaBroadcastAlgorithm() = default;
 
-    void Init(SatelliteForwardingApp *app) override;
+    virtual void Init(SatelliteForwardingApp* app) { m_app = app; }
+    /// Devices on which this satellite sends a new broadcast of its own
+    /// (default: all four ISLs).
+    virtual std::vector<Ptr<NetDevice>> GetFirstHops() const;
+    /// A broadcast arrived for the first time on `device` (`packet` without header).
+    virtual void Forward(Ptr<NetDevice> device, Ptr<Packet> packet, SatPacketHeader header) = 0;
+    /// A broadcast that was received before arrived again on `device`.
+    virtual void OnDuplicate(Ptr<NetDevice> device, const SatPacketHeader& header) {}
+    /// A BROADCAST_CONTROL packet of the algorithm arrived on `device`.
+    virtual void OnControl(Ptr<NetDevice> device, const SatPacketHeader& header) {}
 
-    // Made PUBLIC so RingSwitchScheduler (via SatelliteForwardingApp::TriggerRing*) can call them.
-    void InitiateRingUpSwitch   ();
-    void InitiateRingDownSwitch ();
+  protected:
+    /// The four ISL devices: up, down, left, right.
+    std::array<Ptr<NetDevice>, 4> GetDevices() const;
+    /// Index of `device` in GetDevices() (-1: unknown device).
+    int GetPortIndex(Ptr<NetDevice> device) const;
+    /// Sends a copy of `packet` with `header` on `device` (broadcast queue).
+    void Send(Ptr<NetDevice> device, Ptr<Packet> packet, const SatPacketHeader& header) const;
 
-private:
-    static constexpr uint16_t BROADCAST_PROTO = 0x0801;
+    SatelliteForwardingApp* m_app{nullptr};
+};
 
-    char filename_packet_monitoring[512];
+/**
+ * Storage ring routing with ring switches for Walker-Delta constellations
+ * (constellations without a seam, e.g. Starlink).
+ *
+ * UP copies travel upwards in their orbit, DOWN copies downwards. Every copy
+ * goes once around its orbit and leaves it at the exit satellite of the orbit
+ * towards the next orbit; the exits of all orbits form a closed ring. The
+ * exits move by one position at every ring switch. See the description at the
+ * top of the .cc file.
+ */
+class RoutingRingSwitchDelta : public RoutingStrategy
+{
+  public:
+    /// Names of the broadcast algorithms; the first one is the default.
+    static std::vector<std::string> GetBroadcastAlgorithmNames();
 
-    // Highest UP / DOWN switch epoch this satellite has seen (on passing
-    // traffic or as initiator). The initiator of the next switch uses +1.
-    uint32_t m_maxDownEpochSeen  {0};
-    uint32_t m_maxUpEpochSeen    {0};
+    /// `broadcastAlgorithm`: one of GetBroadcastAlgorithmNames() (empty: default).
+    explicit RoutingRingSwitchDelta(const std::string& broadcastAlgorithm = "");
+    ~RoutingRingSwitchDelta() override;
 
-    // ── Ring roles (overview 2-5 in the .cc) ─────────────────────────────────
-    // Exit position of every orbit at epoch 0 (from the constellation config,
-    // one ring satellite per orbit); at epoch e the exit of orbit k is
-    // (exit0[k] - e) mod No.
+    void Init(SatelliteForwardingApp* app) override;
+    bool OnReceive(Ptr<NetDevice> device,
+                   Ptr<const Packet> packet,
+                   uint16_t protocol,
+                   const Address& sender) override;
+    std::vector<Ptr<NetDevice>> GetBroadcastFirstHops() const override;
+    /// Called on the new exit of the kink orbit when a switch starts.
+    void InitiateRingUpSwitch() override;
+    void InitiateRingDownSwitch() override;
+
+  private:
+    /// True if `sat` is the exit of its orbit in the given epoch.
+    bool IsUpExit(uint32_t sat, uint32_t epoch) const;
+    bool IsDownExit(uint32_t sat, uint32_t epoch) const;
+    /// Takes the role (exit, entry or none) of this satellite in `epoch`.
+    void UpdateUpRole(uint32_t epoch, bool announce, bool initiator);
+    void UpdateDownRole(uint32_t epoch);
+
+    void ReceiveUp(Ptr<NetDevice> device, Ptr<Packet> packet, SatPacketHeader& header);
+    void ReceiveDown(Ptr<NetDevice> device, Ptr<Packet> packet, SatPacketHeader& header);
+    void ReceiveBroadcast(Ptr<NetDevice> device, Ptr<Packet> packet, SatPacketHeader& header);
+
+    /// Output device of a copy that arrived on `device` (nullptr: no rule).
+    /// `leavesOrbit` is set if the copy leaves the orbit over the ring ISL.
+    Ptr<NetDevice> RouteUp(Ptr<NetDevice> device, bool& leavesOrbit) const;
+    /// DOWN copies exit at the exit of their own `epoch`, which the switch
+    /// initiator raises for copies entering there.
+    Ptr<NetDevice> RouteDown(Ptr<NetDevice> device, uint32_t& epoch);
+
+    /// Highest epoch seen per ring (on passing copies or as switch initiator).
+    uint32_t m_maxUpEpoch{0};
+    uint32_t m_maxDownEpoch{0};
+
+    /// Exit position of every orbit at epoch 0; at epoch e the exit of orbit k
+    /// is at position (exit0[k] - e) mod satellitesPerOrbit.
     std::vector<int32_t> m_upExit0;
     std::vector<int32_t> m_downExit0;
-    bool     m_rolesInit {false};
-    bool     m_upExit    {false};     // UP exit of epoch m_maxUpEpochSeen (exits UP lap traffic to the right)
-    bool     m_downExit  {false};     // DOWN exit of epoch m_maxDownEpochSeen (ring membership only,
-                                      // DOWN copies are routed by their own epoch)
-    uint32_t m_leftPeer  {UINT32_MAX};// sat id of the left / right ISL neighbour
-    uint32_t m_rightPeer {UINT32_MAX};
-    // DOWN switch (overview 5): epoch given to copies entering over devRight
-    // (non-zero only on DOWN switch initiators) and the newest epoch this
-    // satellite has exited (dummies on the first exit of a new epoch).
-    uint32_t m_downInitiated {0};
-    uint32_t m_downExitEpoch {0};
-    // DOWN queue regulation (overview 6): DOWN queue level at the end of the
-    // fill phase, restored with dummies before a DOWN copy is queued.
-    bool     m_downBaseRecorded {false};
-    uint64_t m_downBaseOcc      {0};
-    void RegulateDownQueue ();
+    /// Sat ids of the left / right ISL neighbours.
+    uint32_t m_leftPeer{UINT32_MAX};
+    uint32_t m_rightPeer{UINT32_MAX};
 
-    void InitRoles ();
-    bool IsUpExitSat   (uint32_t sat, uint32_t epoch) const;
-    bool IsDownExitSat (uint32_t sat, uint32_t epoch) const;
-    void UpdateUpRole   (uint32_t epoch, bool announce, bool initiator);
-    void UpdateDownRole (uint32_t epoch);
+    /// UP exit of epoch m_maxUpEpoch.
+    bool m_upExit{false};
+    /// DOWN switch: epoch given to copies entering here (initiators only).
+    uint32_t m_downInitiatedEpoch{0};
+    /// Newest epoch of the DOWN copies this satellite has sent to the next orbit.
+    uint32_t m_downExitEpoch{0};
 
-    // ── Broadcast State ───────────────────────────────────────────────────────
-    // Duplicate suppression bounded by a two-window rotation: entries survive
-    // between 1x and 2x TTL, never less, so a packet that could still legally
-    // arrive is always still recorded.
-    // std::unordered_set<uint64_t> m_seenCurr;
-    // std::unordered_set<uint64_t> m_seenPrev;
-    // uint64_t m_seenWindowStart {0};
-    // bool SeenBefore (uint64_t key, uint64_t now_ms);
-
-    static constexpr uint32_t SEEN_W     = 32768;      // ids per origin in the window
-    static constexpr uint32_t SEEN_WORDS = SEEN_W / 64;
-
-    struct SeenWindow {
-        uint32_t base {0};              // lowest id represented; always a multiple of 64
-        bool     init {false};
-        std::vector<uint64_t> bits;
-    };
-    std::vector<SeenWindow> m_seen;     // indexed by origin sat id
-    uint64_t m_seen_too_old {0};        // canary: must stay ~0
-
-    bool SeenBefore (uint16_t origin, uint32_t id);
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-    // fill the queue of `device` with dummy packets up to amount-1 packets
-    void InsertDummyPackets(uint32_t amount, Ptr<NetDevice> device);
-
-    // second copy of a flagged object in `direction` (fill phase only)
-    bool DuplicatePacket(direction_t direction, uint32_t id, uint16_t origin, 
-                        uint64_t ttl, uint32_t obj_id, uint32_t frag_id, uint64_t time);
-
-    // Output device for an UP / DOWN copy that arrived on `device`
-    // (nullptr: no rule -> counted as dropped). `crossesRing` is set when the
-    // copy leaves the orbit over the ring ISL. UP: the copy then carries the
-    // exit's epoch. DOWN: the copy's own `epoch` decides where it exits; the
-    // switch initiator raises it for copies entering there.
-    Ptr<NetDevice> RouteUp   (Ptr<NetDevice> device, bool& crossesRing) const;
-    Ptr<NetDevice> RouteDown (Ptr<NetDevice> device, uint32_t& epoch, bool& crossesRing);
-    void LogUnknownDevice(int code, uint32_t last_hop);
-
+    std::unique_ptr<DeltaBroadcastAlgorithm> m_broadcast;
+    BroadcastFilter m_broadcastFilter;
 };
 
 } // namespace ns3
-#endif // ROUTING_RING_SWITCH_DELTA_H
+
+#endif // ROUTING_RING_SWITCH_WALKER_DELTA_H

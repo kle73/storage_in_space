@@ -1,528 +1,444 @@
-/**
- * storage_in_space.cc
- * Initiates the simulation
- * Reads TLE files and creates corresponding Satellite and Mobility objects
- * These are assigned to nodes which are assigned to MPI ranks (if enabled)
- *
- * Topology (numOrbits × satellitesPerOrbit fully connected torus)
- * is created and ISL devices are instantiated and connected.
- *
- * SatelliteForwardingApps (satellite-forwarding-app.h/.cc) are created 
- * and assigned to each node.
- *
- * IMPORTANT: This module assumes the TLE files to be sorted and grouped 
-              by orbits. 
- */
+// Storage in Space: main program.
+//
+// Reads the TLE file of the constellation, creates one node per satellite with
+// its orbit (SGP4) mobility model, connects the satellites with laser ISLs,
+// installs a SatelliteForwardingApp on every satellite of this MPI rank, sets
+// up the ring-switch scheduler and runs the simulation.
+//
+// Node id = orbit * satellitesPerOrbit + position in the orbit. The TLE file
+// must therefore be grouped by orbit and sorted by mean anomaly within each
+// orbit.
 
 #include "ns3/core-module.h"
-#include "ns3/network-module.h"
 #include "ns3/mobility-module.h"
+#include "ns3/network-module.h"
 #include "ns3/point-to-point-laser-helper.h"
-#include "ns3/satellite.h"
-#include "ns3/satellite-position-mobility-model.h"
-#include "ns3/satellite-forwarding-app.h"
 #include "ns3/ring-switch-scheduler.h"
+#include "ns3/routing-ring-switch-walker-delta.h"
+#include "ns3/satellite-forwarding-app.h"
+#include "ns3/satellite-position-mobility-model.h"
+#include "ns3/satellite.h"
 
 #ifdef NS3_MPI
 #include "ns3/mpi-interface.h"
 #endif
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
 #include <iostream>
-#include <vector>
-#include <string>
+#include <sstream>
 #include <stdexcept>
-
-#include <stdlib.h>
+#include <string>
+#include <vector>
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE ("StorageInSpace");
+NS_LOG_COMPONENT_DEFINE("StorageInSpace");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TLE file reader
-// TLE files must be grouped by orbit and within each orbit the entries must be
-// sorted by their mean anomaly.
-// ─────────────────────────────────────────────────────────────────────────────
-struct TleEntry { 
-    std::string name; 
-    std::string line1; 
+namespace
+{
+
+struct TleEntry
+{
+    std::string name;
+    std::string line1;
     std::string line2;
- };
+};
 
-struct TleData {
-    int64_t numOrbits;
-    int64_t satellitesPerOrbit;
+struct TleData
+{
+    uint32_t numOrbits{0};
+    uint32_t satellitesPerOrbit{0};
     std::vector<TleEntry> entries;
 };
 
-static TleData ReadTleFile (const std::string& path)
+/// Reads a TLE file: first line "<orbits> <satellites per orbit>", then three
+/// lines (name, line 1, line 2) per satellite.
+TleData
+ReadTleFile(const std::string& path)
 {
-    std::ifstream fs (path);
-    if (!fs.is_open ())
-        throw std::runtime_error ("Cannot open TLE file: " + path);
+    std::ifstream file(path);
+    if (!file.is_open())
+    {
+        throw std::runtime_error("Cannot open TLE file: " + path);
+    }
 
     TleData data;
-    std::string header;
-    std::getline (fs, header);
+    std::string line;
+    std::getline(file, line);
+    std::istringstream(line) >> data.numOrbits >> data.satellitesPerOrbit;
+
+    std::string name;
+    std::string line1;
+    std::string line2;
+    while (std::getline(file, name))
     {
-        std::istringstream iss (header);
-        iss >> data.numOrbits >> data.satellitesPerOrbit;
+        if (name.empty())
+        {
+            continue;
+        }
+        if (!std::getline(file, line1) || !std::getline(file, line2))
+        {
+            throw std::runtime_error("Truncated TLE file: " + path);
+        }
+        data.entries.push_back({name, line1, line2});
     }
-
-    std::string name, l1, l2;
-    while (std::getline (fs, name)) {
-        if (name.empty ()) continue;
-        if (!std::getline (fs, l1) || !std::getline (fs, l2))
-            throw std::runtime_error ("Truncated TLE file");
-        data.entries.push_back ({name, l1, l2});
+    if (data.entries.size() != static_cast<std::size_t>(data.numOrbits) * data.satellitesPerOrbit)
+    {
+        throw std::runtime_error("TLE entry count does not match the header: " + path);
     }
-
-    if ((int64_t)data.entries.size () != data.numOrbits * data.satellitesPerOrbit)
-        throw std::runtime_error ("TLE entry count does not match header");
-
     return data;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Grid indexing:  nodeId = orbit * satellitesPerOrbit + position
-// ─────────────────────────────────────────────────────────────────────────────
-static inline uint32_t NId (int64_t orbit, int64_t pos, int64_t S)
+/// MPI rank (within its orbit) of the satellite at `position`: every orbit is
+/// split into `ranksPerOrbit` consecutive blocks; the first blocks get one
+/// satellite more if the orbit cannot be split evenly.
+uint32_t
+RankInOrbit(uint32_t position, uint32_t satellitesPerOrbit, uint32_t ranksPerOrbit)
 {
-    return static_cast<uint32_t> (orbit * S + pos);
+    const uint32_t small = satellitesPerOrbit / ranksPerOrbit;
+    const uint32_t numLarge = satellitesPerOrbit % ranksPerOrbit;
+    const uint32_t large = small + 1;
+    if (position < numLarge * large)
+    {
+        return position / large;
+    }
+    return numLarge + (position - numLarge * large) / small;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
-int main (int argc, char* argv[])
+} // namespace
+
+int
+main(int argc, char* argv[])
 {
-    // ── 1. Parameters ────────────────────────────────────────────────────────
-    // Set by the run scripts e.g. ns-3.45/run_iridium.sh
-    // Relative paths are relative to the folder the simulation runs in (ns-3.45/).
-    std::string tleDir              = "scratch/satellite-simulation-data";
-    std::string constellation       = "iridium";
-    double      simDurationS        = 40.0;
-    double      islDataRateMbps     = 80000.0;
-    uint32_t    islMaxQueuePkts     = 4000;
-    bool        forceStatic         = false;
-    bool        nullmsg             = true;  // type of MPI algorithm
-    uint8_t     numRanksPerOrbit    = 2;
-    bool        useBackpressure     = false;
-    float       inclination         = 86.4;
-    uint32_t    maxQueueFillLevel   = 1;
-    uint32_t    trafficShare        = 2;
-    uint32_t    trafficShareBroadcast = 1;
-    uint32_t    runNumber           = 0;
-
-    // Routing strategy (SatelliteForwardingApp::SetupWithDevices):
-    //   ring-switch-walker-star   ring routing with ring switches, Walker-Star (Iridium)
-    //   ring-switch-walker-delta  ring routing with ring switches, Walker-Delta (Starlink)
-    std::string routingAlgorithm   = "ring-switch-walker-star";
-
-    // Content generation strategy:
-    //   fill-double               fills the system, two copies (UP / DOWN) per object
-    std::string        contentGeneration  = "fill-double";
-
-    std::string        statistics         = "standard";
-
-    // Folder for all output files (statistics, debug, positions, ...).
-    // Relative paths are resolved against the folder the simulation runs in
-    // (e.g. ns-3.45/ when started from there), absolute paths are used as is.
-    // The layout below it is fixed (queue_stats/experiment4/..., see
-    // SatelliteForwardingApp::StartApplication). Missing folders are created.
-    std::string        outDir             = "mysim_results";
+    // ── Parameters ───────────────────────────────────────────────────────────
+    // Relative paths are relative to the folder the simulation runs in.
+    std::string tleDir = "scratch/satellite-simulation-data";
+    std::string constellation = "iridium";
+    std::string routingAlgorithm = "ring-switch-walker-star";
+    std::string contentGeneration = "fill-double";
+    const std::vector<std::string> broadcastAlgorithms = RoutingRingSwitchDelta::GetBroadcastAlgorithmNames();
+    std::string broadcastAlgorithm = broadcastAlgorithms.front();
+    std::string outDir = "mysim_results";
+    double simDurationS = 40.0;
+    double islDataRateMbps = 80000.0;
+    uint32_t islQueueSize = 4000;
+    uint32_t maxQueueFillLevel = 1;
+    uint32_t objectSize = 10;
+    uint64_t objectTtl = 10000;
+    uint32_t trafficShare = 2;
+    uint32_t trafficShareBroadcast = 1;
+    uint32_t numRanksPerOrbit = 2;
+    uint32_t runNumber = 0;
+    bool nullMessage = true;
+    bool forceStatic = false;
+    // accepted for compatibility with existing run scripts, not used
+    bool useBackpressure = false;
+    double inclination = 86.4;
+    std::string statistics = "standard";
 
     CommandLine cmd;
-    cmd.AddValue ("tleDir",             "Folder containing tle-<constellation>.txt", tleDir);
-    cmd.AddValue ("constellation",      "LEO constellation to simulate",        constellation);
-    cmd.AddValue ("simDur",             "Simulation duration [s]",              simDurationS);
-    cmd.AddValue ("islRate",            "ISL data rate [Mbps]",                 islDataRateMbps);
-    cmd.AddValue ("islQueue",           "ISL max queue size [packets]",         islMaxQueuePkts);
-    cmd.AddValue ("forceStatic",        "Use static satellite positions",       forceStatic);
-    cmd.AddValue ("nullmsg",            "Use null-message sync",                nullmsg);
-    cmd.AddValue ("numRanksPerOrbit",   "How many MPI ranks for one orbit",     numRanksPerOrbit);
-    cmd.AddValue ("useBackpressure",    "",                                     useBackpressure);
-    cmd.AddValue ("inclination",        "",                                     inclination);
-    cmd.AddValue ("maxQueueFillLevel",  "",                                     maxQueueFillLevel);
-    cmd.AddValue ("routingAlgorithm",   "ring-switch-walker-star | ring-switch-walker-delta", routingAlgorithm);
-    cmd.AddValue ("contentGeneration",  "fill-double",                          contentGeneration);
-    cmd.AddValue ("statistics",         "",                                     statistics);
-    cmd.AddValue ("trafficShare",       "TDMA slots per period for the data (storage) queue of each laser device", trafficShare);
-    cmd.AddValue ("trafficShareBroadcast", "TDMA slots per period for the broadcast queue of each laser device "
-                                        "(0: the data queue gets the whole link)", trafficShareBroadcast);
-    cmd.AddValue ("runNumber",          "",                                     runNumber);
-    cmd.AddValue ("outDir",             "Folder for all output files (relative to the run folder, or absolute)", outDir);
-    cmd.Parse (argc, argv);
-
-    // Fail early on unknown strategy names (keep this list in sync with
-    // SatelliteForwardingApp::SetupWithDevices; its check is compiled out in
-    // optimized builds).
-    if (routingAlgorithm != "ring-switch-walker-star" && routingAlgorithm != "ring-switch-walker-delta")
-        NS_FATAL_ERROR ("Unknown --routingAlgorithm=" << routingAlgorithm
-                        << " (ring-switch-walker-star | ring-switch-walker-delta)");
-    if (contentGeneration != "fill-double")
-        NS_FATAL_ERROR ("Unknown --contentGeneration=" << contentGeneration << " (fill-double)");
-
-    // All components write below this folder (SatelliteForwardingApp::OutputPath).
-    SatelliteForwardingApp::SetOutputDir (outDir);
-
-    // Output file to store ISL connections created by this module
-    const std::string isl_connections =
-        SatelliteForwardingApp::OutputPath ("positions/isl_connections.csv");
-    FILE* f = fopen(isl_connections.c_str (), "w");
-    if (f) { fclose(f); }
-
-
-    // ── 2. MPI initialisation ────────────────────────────────────────────────
-#ifdef NS3_MPI
-    if (nullmsg)
+    cmd.AddValue("tleDir", "Folder containing tle-<constellation>.txt", tleDir);
+    cmd.AddValue("constellation", "Constellation (iridium | starlink)", constellation);
+    cmd.AddValue("routingAlgorithm", "ring-switch-walker-star | ring-switch-walker-delta", routingAlgorithm);
+    cmd.AddValue("contentGeneration", "fill-double | broadcast", contentGeneration);
+    std::string broadcastAlgorithmList;
+    for (const std::string& name : broadcastAlgorithms)
     {
-      GlobalValue::Bind("SimulatorImplementationType",
-        StringValue("ns3::NullMessageSimulatorImpl"));
-    } else 
-    {
-      GlobalValue::Bind("SimulatorImplementationType",
-        StringValue("ns3::DistributedSimulatorImpl"));
+        broadcastAlgorithmList += (broadcastAlgorithmList.empty() ? "" : " | ") + name;
     }
-    MpiInterface::Enable (&argc, &argv);
-    uint32_t systemId    = MpiInterface::GetSystemId ();
-    uint32_t systemCount = MpiInterface::GetSize ();
+    cmd.AddValue("broadcastAlgorithm",
+                 "Broadcast algorithm of ring-switch-walker-delta: " + broadcastAlgorithmList,
+                 broadcastAlgorithm);
+    cmd.AddValue("outDir", "Folder for all output files (relative to the run folder, or absolute)", outDir);
+    cmd.AddValue("simDur", "Simulation duration [s]", simDurationS);
+    cmd.AddValue("islRate", "ISL data rate [Mbps]", islDataRateMbps);
+    cmd.AddValue("islQueue", "ISL queue size [packets]", islQueueSize);
+    cmd.AddValue("maxQueueFillLevel", "Fill level of the storage queues [% of islQueue]", maxQueueFillLevel);
+    cmd.AddValue("objectSize", "Packets per object", objectSize);
+    cmd.AddValue("ttl", "Time to live of stored objects [s]", objectTtl);
+    cmd.AddValue("trafficShare",
+                 "TDMA slots per period for the data (storage) queue of each laser device",
+                 trafficShare);
+    cmd.AddValue("trafficShareBroadcast",
+                 "TDMA slots per period for the broadcast queue of each laser device "
+                 "(0: the data queue gets the whole link)",
+                 trafficShareBroadcast);
+    cmd.AddValue("numRanksPerOrbit", "MPI ranks per orbit", numRanksPerOrbit);
+    cmd.AddValue("runNumber", "Appended to the names of the output files", runNumber);
+    cmd.AddValue("nullmsg", "MPI synchronisation: null messages (true) or distributed (false)", nullMessage);
+    cmd.AddValue("forceStatic", "Keep the satellites at their initial positions", forceStatic);
+    cmd.AddValue("useBackpressure", "Not used", useBackpressure);
+    cmd.AddValue("inclination", "Not used", inclination);
+    cmd.AddValue("statistics", "Not used", statistics);
+    cmd.Parse(argc, argv);
+
+    if (routingAlgorithm != "ring-switch-walker-star" && routingAlgorithm != "ring-switch-walker-delta")
+    {
+        NS_FATAL_ERROR("Unknown --routingAlgorithm=" << routingAlgorithm
+                                                     << " (ring-switch-walker-star | ring-switch-walker-delta)");
+    }
+    if (contentGeneration != "fill-double" && contentGeneration != "broadcast")
+    {
+        NS_FATAL_ERROR("Unknown --contentGeneration=" << contentGeneration << " (fill-double | broadcast)");
+    }
+    if (std::find(broadcastAlgorithms.begin(), broadcastAlgorithms.end(), broadcastAlgorithm) ==
+        broadcastAlgorithms.end())
+    {
+        NS_FATAL_ERROR("Unknown --broadcastAlgorithm=" << broadcastAlgorithm << " (" << broadcastAlgorithmList
+                                                       << ")");
+    }
+    NS_ABORT_MSG_IF(trafficShare == 0 && trafficShareBroadcast == 0,
+                    "--trafficShare and --trafficShareBroadcast cannot both be 0");
+    NS_ABORT_MSG_IF(numRanksPerOrbit == 0, "--numRanksPerOrbit must be at least 1");
+
+    SatelliteForwardingApp::SetOutputDir(outDir);
+
+    // ── MPI ──────────────────────────────────────────────────────────────────
+#ifdef NS3_MPI
+    GlobalValue::Bind("SimulatorImplementationType",
+                      StringValue(nullMessage ? "ns3::NullMessageSimulatorImpl"
+                                              : "ns3::DistributedSimulatorImpl"));
+    MpiInterface::Enable(&argc, &argv);
+    const uint32_t systemId = MpiInterface::GetSystemId();
+    const uint32_t systemCount = MpiInterface::GetSize();
 #else
-    uint32_t systemId    = 0;
-    uint32_t systemCount = 1;
+    const uint32_t systemId = 0;
+    const uint32_t systemCount = 1;
 #endif
 
-    // ── 3. Read TLE file ─────────────────────────────────────────────────────
-    TleData tleData = ReadTleFile (tleDir + "/tle-" + constellation + ".txt");
-    int64_t O       = tleData.numOrbits;
-    const int64_t S = tleData.satellitesPerOrbit;
-    const int64_t N = O * S;
+    // ── Constellation ────────────────────────────────────────────────────────
+    const TleData tle = ReadTleFile(tleDir + "/tle-" + constellation + ".txt");
+    const uint32_t numOrbits = tle.numOrbits;
+    const uint32_t satsPerOrbit = tle.satellitesPerOrbit;
+    const uint32_t numSats = numOrbits * satsPerOrbit;
+    auto satId = [satsPerOrbit](uint32_t orbit, uint32_t position) { return orbit * satsPerOrbit + position; };
 
-    // Print some information
     if (systemId == 0)
     {
-        std::cout << "[StorageInSpace]"
-                  << "  orbits=" << O
-                  << "  sats/orbit=" << S
-                  << "  total=" << N
-                  << "  MPI ranks=" << systemCount << std::endl;
-        // laser devices: fixed TDMA slot grid, unused slots of a class stay idle
-        std::cout << "[StorageInSpace]  ISL slots per period: data " << trafficShare
-                  << ", broadcast " << trafficShareBroadcast << "  -> data queue gets "
-                  << (trafficShare + trafficShareBroadcast > 0
-                          ? islDataRateMbps * trafficShare / (trafficShare + trafficShareBroadcast) / 1000.0
-                          : 0.0)
-                  << " of " << islDataRateMbps / 1000.0 << " Gbps" << std::endl;
+        std::cout << "[StorageInSpace]  orbits=" << numOrbits << "  sats/orbit=" << satsPerOrbit
+                  << "  total=" << numSats << "  MPI ranks=" << systemCount << std::endl;
         std::error_code ec;
         const std::filesystem::path outAbs =
-            std::filesystem::absolute (SatelliteForwardingApp::GetOutputDir (), ec);
+            std::filesystem::absolute(SatelliteForwardingApp::GetOutputDir(), ec);
         std::cout << "[StorageInSpace]  output folder: "
-                  << (ec ? SatelliteForwardingApp::GetOutputDir () : outAbs.lexically_normal ().string ())
+                  << (ec ? SatelliteForwardingApp::GetOutputDir() : outAbs.lexically_normal().string())
                   << std::endl;
+        std::cout << "[StorageInSpace]  ISL slots per period: data " << trafficShare << ", broadcast "
+                  << trafficShareBroadcast << "  -> data queue gets "
+                  << islDataRateMbps * trafficShare / (trafficShare + trafficShareBroadcast) / 1000.0 << " of "
+                  << islDataRateMbps / 1000.0 << " Gbps" << std::endl;
+        if (contentGeneration == "broadcast" && routingAlgorithm == "ring-switch-walker-delta")
+        {
+            std::cout << "[StorageInSpace]  broadcast algorithm: " << broadcastAlgorithm << std::endl;
+        }
+    }
+    if (systemCount != 1 && systemCount != numOrbits * numRanksPerOrbit)
+    {
+        NS_FATAL_ERROR("Run with 1 process or with exactly " << numOrbits * numRanksPerOrbit
+                                                              << " processes (orbits x numRanksPerOrbit)");
     }
 
-    if (systemCount != 1 && (int64_t)systemCount != O * numRanksPerOrbit)
-        NS_FATAL_ERROR ("Run with 1 rank (debug) or exactly " << O * numRanksPerOrbit 
-                        << " ranks (one per orbit).");
-
-
-    // ── 4. Create nodes and assign MPI system-ids ────────────────────────────
     NodeContainer nodes;
-    nodes.Create (static_cast<uint32_t> (N));
-
-#ifdef NS3_MPI
-    // Rank assignment (only with several MPI processes; a single process keeps
-    // all satellites on rank 0, the default SystemId):
-    // assigns satellites to MPI ranks such that the rest (r) is split across the first 
-    // r ranks (one each) if numSatsPerOrbit (S) % numRanksPerOrbit = r > 0
+    nodes.Create(numSats);
     if (systemCount > 1)
     {
-    uint16_t num_per_rank_low = S / numRanksPerOrbit; 
-
-	for (int orbit=0; orbit<O; orbit++) 
-	{
-		uint16_t rank_in_orbit = 0;
-		uint16_t rest = S % numRanksPerOrbit;             
-		uint8_t done = 0;
-		for (int sat=0; sat<S; sat++)
-		{
-			uint16_t sat_num = orbit*S + sat;
-			uint32_t rank = rank_in_orbit + orbit*numRanksPerOrbit;
-            nodes.Get (static_cast<uint32_t>(sat_num))
-                ->SetAttribute ("SystemId", UintegerValue (rank));
-			if (rest > 0)
-			{
-				if ((sat+1) % (num_per_rank_low+1) == 0)
-				{
-					rest--;
-					rank_in_orbit++;
-					if (rest == 0){
-						done = sat+1;
-					}
-				}
-			}else if (rest == 0) 
-			{
-				if((sat-done+1) % num_per_rank_low == 0)
-				{
-					rank_in_orbit++;
-				}
-			}
-		}
-	}
-    }
-#endif
-
-    // ── 5. Mobility models  ────────────────
-    for (int64_t i = 0; i < N; ++i)
-    {
-        Ptr<Node> node = nodes.Get (static_cast<uint32_t>(i));
-        // NO MPI skip here — all ranks need mobility on all nodes
-        // because p2p.Install() calls GetDistanceFrom() on both endpoints
-
-        const TleEntry& tle = tleData.entries[static_cast<size_t>(i)];
-        Ptr<Satellite> sat = CreateObject<Satellite> ();
-        sat->SetName    (tle.name);
-        sat->SetTleInfo (tle.line1, tle.line2);
-
-        MobilityHelper mob;
-        if (forceStatic) {
-            mob.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
-            mob.Install (node);
-            node->GetObject<MobilityModel> ()
-                ->SetPosition (sat->GetPosition (sat->GetTleEpoch ()));
-        } else {
-            mob.SetMobilityModel (
-                "ns3::SatellitePositionMobilityModel",
-                "SatellitePositionHelper",
-                SatellitePositionHelperValue (SatellitePositionHelper (sat)));
-            mob.Install (node);
-        }
-    }
-
-    // ── 6. Install ISL links and build per-node device tables ────────────────
-    //
-    // We install links in two rounds so we can record which device goes in
-    // which direction, without depending on device-index ordering.
-    //
-    // devUp[i]    = net-device on node i that leads to node i's UP neighbour
-    // devDown[i]  = net-device on node i that leads to node i's DOWN neighbour
-    // devRight[i] = net-device on node i that leads to node i's RIGHT neighbour
-    // devLeft[i]  = net-device on node i that leads to node i's LEFT neighbour
-
-    std::vector<Ptr<NetDevice>> devUp   (static_cast<size_t>(N));
-    std::vector<Ptr<NetDevice>> devDown (static_cast<size_t>(N));
-    std::vector<Ptr<NetDevice>> devRight(static_cast<size_t>(N));
-    std::vector<Ptr<NetDevice>> devLeft (static_cast<size_t>(N));
-
-    // Info for the Scheduler Module
-    std::vector<uint32_t>              islRightPartner(static_cast<size_t>(N), UINT32_MAX);
-    std::vector<std::vector<uint32_t>> orbits(O, std::vector<uint32_t>(S, UINT32_MAX));
-
-    PointToPointLaserHelper p2p;
-    std::string qStr = std::to_string (islMaxQueuePkts) + "p";
-    p2p.SetQueue ("ns3::DropTailQueue<Packet>",
-                  "MaxSize", QueueSizeValue (QueueSize (qStr)));
-    p2p.SetDeviceAttribute ("DataRate",
-                            DataRateValue (DataRate (
-                                std::to_string (islDataRateMbps) + "Mbps")));
-    const uint32_t laserMtu = SatelliteForwardingApp::maxPayloadSize
-                        + RingSwitchStarHeader ().GetSerializedSize ();   // 1500 + 42
-    p2p.SetDeviceAttribute ("Mtu", UintegerValue (laserMtu + 6)); // we need 1548
-    p2p.SetDeviceAttribute ("TrafficShare", UintegerValue (trafficShare));
-    NS_ABORT_MSG_IF (trafficShare == 0 && trafficShareBroadcast == 0,
-                     "--trafficShare and --trafficShareBroadcast cannot both be 0");
-    p2p.SetDeviceAttribute ("TrafficShareBroadcast", UintegerValue (trafficShareBroadcast));
-
-    
-
-    // ── Helper: Euclidean distance between two nodes ──────────────────────────────
-    auto getPos = [&](uint32_t id) {
-        return nodes.Get(id)->GetObject<MobilityModel>()->GetPosition();
-    };
-    auto euclidean = [&](uint32_t idA, uint32_t idB) -> double {
-        Vector a = getPos(idA), b = getPos(idB);
-        double dx = a.x-b.x, dy = a.y-b.y, dz = a.z-b.z;
-        return std::sqrt(dx*dx + dy*dy + dz*dz);
-    };
-
-    // ── Round A: UP/DOWN links — closest neighbour in same orbit ──────────────────
-    // Within a circular orbit, each satellite has exactly two neighbours.
-    // We connect (o,p) → (o,(p+1)%S) — the ring order in the TLE files
-    // already matches physical orbital order (sorted by Mean Anomaly), so
-    // adjacent slots are always the two physically closest satellites.
-    for (int64_t o = 0; o < O; ++o)
-    {
-        for (int64_t p = 0; p < S; ++p)
+        for (uint32_t orbit = 0; orbit < numOrbits; orbit++)
         {
-            int64_t  pNext = (p + 1) % S;
-            uint32_t idA   = NId (o, p,     S);
-            uint32_t idB   = NId (o, pNext, S);
-
-            NodeContainer nc;
-            nc.Add (nodes.Get (idA));
-            nc.Add (nodes.Get (idB));
-            NetDeviceContainer ndc = p2p.Install (nc);
-
-            devUp  [idA] = ndc.Get (0);
-            devDown[idB] = ndc.Get (1);
-
-            orbits[o][p] = idA;
-
-            if (systemId == 0){
-                f = fopen(isl_connections.c_str (), "a");
-                if (f) { fprintf(f, "Node %u --- UP --- %u\n", idA, idB); fclose(f); }
+            for (uint32_t position = 0; position < satsPerOrbit; position++)
+            {
+                const uint32_t rank =
+                    orbit * numRanksPerOrbit + RankInOrbit(position, satsPerOrbit, numRanksPerOrbit);
+                nodes.Get(satId(orbit, position))->SetAttribute("SystemId", UintegerValue(rank));
             }
         }
     }
 
-    // ── Round B: RIGHT/LEFT links — closest satellite in adjacent orbit ───────────
-    //
-    // For each satellite (o,p) we find the slot q in orbit (o+1)%O whose
-    // current position is closest. We then install the link (o,p)↔(o+1,q).
-    //
-    // To guarantee a valid matching (no satellite gets two RIGHT-neighbours or
-    // two LEFT-neighbours) we use a greedy minimum-weight matching:
-    //   - Sort all O*S candidate pairs by distance.
-    //   - Accept a pair only if neither endpoint has been matched yet.
-    //
-    // This produces a perfect 1-to-1 matching per orbit-pair.
-
-    for (int64_t o = 0; o < O; ++o)
+    // Every rank needs the mobility of all nodes (the ISL delays depend on it).
+    for (uint32_t i = 0; i < numSats; i++)
     {
-        int64_t oNext = (o + 1) % O;
+        Ptr<Satellite> satellite = CreateObject<Satellite>();
+        satellite->SetName(tle.entries[i].name);
+        satellite->SetTleInfo(tle.entries[i].line1, tle.entries[i].line2);
 
-        // Build all S×S candidate pairs with distances
-        struct Candidate { double dist; int64_t p, q; };
+        MobilityHelper mobility;
+        if (forceStatic)
+        {
+            mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+            mobility.Install(nodes.Get(i));
+            nodes.Get(i)->GetObject<MobilityModel>()->SetPosition(
+                satellite->GetPosition(satellite->GetTleEpoch()));
+        }
+        else
+        {
+            mobility.SetMobilityModel("ns3::SatellitePositionMobilityModel",
+                                      "SatellitePositionHelper",
+                                      SatellitePositionHelperValue(SatellitePositionHelper(satellite)));
+            mobility.Install(nodes.Get(i));
+        }
+    }
+
+    // ── ISLs ─────────────────────────────────────────────────────────────────
+    PointToPointLaserHelper laser;
+    laser.SetQueue("ns3::DropTailQueue<Packet>",
+                   "MaxSize",
+                   QueueSizeValue(QueueSize(std::to_string(islQueueSize) + "p")));
+    laser.SetDeviceAttribute("DataRate", DataRateValue(DataRate(std::to_string(islDataRateMbps) + "Mbps")));
+    // Payload + header = 1542 bytes. With an MTU of 1548 a TDMA slot (MTU + 2
+    // bytes PPP header) lasts a whole number of nanoseconds at the usual rates.
+    const uint32_t mtu = SatelliteForwardingApp::kPayloadSize + SatPacketHeader().GetSerializedSize() + 6;
+    laser.SetDeviceAttribute("Mtu", UintegerValue(mtu));
+    laser.SetDeviceAttribute("TrafficShare", UintegerValue(trafficShare));
+    laser.SetDeviceAttribute("TrafficShareBroadcast", UintegerValue(trafficShareBroadcast));
+
+    std::vector<Ptr<NetDevice>> devUp(numSats);
+    std::vector<Ptr<NetDevice>> devDown(numSats);
+    std::vector<Ptr<NetDevice>> devRight(numSats);
+    std::vector<Ptr<NetDevice>> devLeft(numSats);
+    // for the ring-switch scheduler
+    std::vector<uint32_t> rightPartner(numSats, UINT32_MAX);
+
+    const std::string islFile = SatelliteForwardingApp::OutputPath("positions/isl_connections.csv");
+    FILE* islLog = (systemId == 0) ? std::fopen(islFile.c_str(), "w") : nullptr;
+
+    // Up / down: consecutive satellites of an orbit (the TLE order is the
+    // order along the orbit).
+    for (uint32_t orbit = 0; orbit < numOrbits; orbit++)
+    {
+        for (uint32_t position = 0; position < satsPerOrbit; position++)
+        {
+            const uint32_t a = satId(orbit, position);
+            const uint32_t b = satId(orbit, (position + 1) % satsPerOrbit);
+            NetDeviceContainer devices = laser.Install(nodes.Get(a), nodes.Get(b));
+            devUp[a] = devices.Get(0);
+            devDown[b] = devices.Get(1);
+            if (islLog)
+            {
+                std::fprintf(islLog, "Node %u --- UP --- %u\n", a, b);
+            }
+        }
+    }
+
+    // Right / left: every satellite is connected to one satellite of the next
+    // orbit. Greedy minimum-distance matching on the initial positions: all
+    // pairs sorted by distance, a pair is taken if both satellites are free.
+    auto distance = [&nodes](uint32_t a, uint32_t b) {
+        const Vector pa = nodes.Get(a)->GetObject<MobilityModel>()->GetPosition();
+        const Vector pb = nodes.Get(b)->GetObject<MobilityModel>()->GetPosition();
+        return CalculateDistance(pa, pb);
+    };
+    for (uint32_t orbit = 0; orbit < numOrbits; orbit++)
+    {
+        const uint32_t next = (orbit + 1) % numOrbits;
+        struct Candidate
+        {
+            double distance;
+            uint32_t p;
+            uint32_t q;
+        };
+
         std::vector<Candidate> candidates;
-        candidates.reserve(static_cast<size_t>(S * S));
-
-        for (int64_t p = 0; p < S; ++p)
-            for (int64_t q = 0; q < S; ++q)
-                candidates.push_back({
-                    euclidean(NId(o, p, S), NId(oNext, q, S)),
-                    p, q
-                });
-
-        std::sort(candidates.begin(), candidates.end(),
-                [](const Candidate& a, const Candidate& b){
-                    return a.dist < b.dist;
-                });
-
-        // Greedy matching
-        std::vector<bool> usedP(static_cast<size_t>(S), false);
-        std::vector<bool> usedQ(static_cast<size_t>(S), false);
-        int64_t matched = 0;
-
-        for (const auto& c : candidates)
+        candidates.reserve(static_cast<std::size_t>(satsPerOrbit) * satsPerOrbit);
+        for (uint32_t p = 0; p < satsPerOrbit; p++)
         {
-            if (matched == S) break;
-            if (usedP[static_cast<size_t>(c.p)] || usedQ[static_cast<size_t>(c.q)])
+            for (uint32_t q = 0; q < satsPerOrbit; q++)
+            {
+                candidates.push_back({distance(satId(orbit, p), satId(next, q)), p, q});
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& x, const Candidate& y) {
+            return x.distance < y.distance;
+        });
+
+        std::vector<bool> usedP(satsPerOrbit, false);
+        std::vector<bool> usedQ(satsPerOrbit, false);
+        uint32_t matched = 0;
+        for (const Candidate& c : candidates)
+        {
+            if (matched == satsPerOrbit)
+            {
+                break;
+            }
+            if (usedP[c.p] || usedQ[c.q])
+            {
                 continue;
+            }
+            usedP[c.p] = true;
+            usedQ[c.q] = true;
+            matched++;
 
-            usedP[static_cast<size_t>(c.p)] = true;
-            usedQ[static_cast<size_t>(c.q)] = true;
-            ++matched;
-
-            uint32_t idA = NId(o,     c.p, S);
-            uint32_t idB = NId(oNext, c.q, S);
-
-            NodeContainer nc;
-            nc.Add (nodes.Get (idA));
-            nc.Add (nodes.Get (idB));
-            NetDeviceContainer ndc = p2p.Install (nc);
-
-            devRight[idA] = ndc.Get (0);
-            devLeft [idB] = ndc.Get (1);
-
-            islRightPartner[idA] = idB; 
-
-            if (systemId == 0){
-                f = fopen(isl_connections.c_str (), "a");
-                if (f) { fprintf(f, "Node %u --- Right --- %u\n", idA, idB); fclose(f); }
+            const uint32_t a = satId(orbit, c.p);
+            const uint32_t b = satId(next, c.q);
+            NetDeviceContainer devices = laser.Install(nodes.Get(a), nodes.Get(b));
+            devRight[a] = devices.Get(0);
+            devLeft[b] = devices.Get(1);
+            rightPartner[a] = b;
+            if (islLog)
+            {
+                std::fprintf(islLog, "Node %u --- Right --- %u\n", a, b);
             }
         }
-
-        NS_ASSERT_MSG(matched == S,
-            "RIGHT/LEFT matching failed for orbit " << o << ": only "
-            << matched << "/" << S << " pairs found.");
+        NS_ABORT_MSG_IF(matched != satsPerOrbit, "Right/left matching failed for orbit " << orbit);
     }
-
-    if (systemId == 0){
-        for (int o=0; o<O; o++){
-            for (int p=0; p<S; p++){
-                printf("Orbit %d: %u --> %u\n", o, orbits[o][p], islRightPartner[orbits[o][p]]);
-            }
-        }
-    }
-
-    // ── 7. Install forwarding application on local nodes ─────────────────────
-
-    // Collect app pointers (indexed by nodeId) for the ring-switch scheduler.
-    std::vector<SatelliteForwardingApp*> allApps(static_cast<size_t>(N), nullptr);
-
-    for (int64_t i = 0; i < N; ++i)
+    if (islLog)
     {
-        Ptr<Node> node = nodes.Get (static_cast<uint32_t>(i));
-
-#ifdef NS3_MPI
-        if (systemCount > 1 && node->GetSystemId () != systemId) continue;
-#endif
-        size_t si = static_cast<size_t>(i);
-        bool isSeed = (i == 0 && systemId == 0);
-
-        Ptr<SatelliteForwardingApp> app = CreateObject<SatelliteForwardingApp> ();
-        NS_ASSERT_MSG (devRight[si],
-        "STORAGE IN SPACE : null device on sat " << si);
-        app->SetupWithDevices (
-            static_cast<uint32_t> (S),
-            static_cast<uint32_t> (N),
-            devUp[si], devDown[si], devRight[si], devLeft[si],
-            isSeed,
-            inclination,
-            maxQueueFillLevel,
-            routingAlgorithm,
-            contentGeneration,
-            statistics,
-            useBackpressure,
-            MakeConstellationConfig (constellation),
-            trafficShare,
-            runNumber);
-
-        node->AddApplication (app);
-        app->SetStartTime (Seconds (0.0));
-        app->SetStopTime  (Seconds (simDurationS));
-        allApps[si] = PeekPointer(app);
+        std::fclose(islLog);
     }
 
-    // ── 8 Dynamic ring-switch scheduler ─────────────────
-    // The scheduler pre-computes geometry-optimal switch times and drives continuous
-    // ring switching. Only needed for ring-double
-    RingSwitchScheduler ringScheduler;
-    if (routingAlgorithm == "ring-switch-walker-star" || routingAlgorithm == "ring-switch-walker-delta") {
-        ConstellationConfig schedCfg = MakeConstellationConfig(constellation);
-        ringScheduler.Setup(schedCfg, static_cast<uint32_t>(S), static_cast<uint32_t>(O),
-                             allApps, nodes, islRightPartner, orbits, systemId);
-        // Wire scheduler pointer into each local app so terminus can call back.
-        for (auto* ap : allApps) {
-            if (ap) ap->m_ringScheduler = &ringScheduler;
+    // ── Applications ─────────────────────────────────────────────────────────
+    SatelliteForwardingAppParams params;
+    params.satellitesPerOrbit = satsPerOrbit;
+    params.numSatellites = numSats;
+    params.routingAlgorithm = routingAlgorithm;
+    params.contentGeneration = contentGeneration;
+    params.broadcastAlgorithm = broadcastAlgorithm;
+    params.constellation = MakeConstellationConfig(constellation);
+    params.maxQueueFillLevel = maxQueueFillLevel;
+    params.objectSize = objectSize;
+    params.objectTtl = objectTtl;
+    params.runNumber = runNumber;
+
+    // indexed by node id, nullptr for the satellites of other ranks
+    std::vector<SatelliteForwardingApp*> apps(numSats, nullptr);
+    for (uint32_t i = 0; i < numSats; i++)
+    {
+        Ptr<Node> node = nodes.Get(i);
+        if (systemCount > 1 && node->GetSystemId() != systemId)
+        {
+            continue;
         }
-        ringScheduler.Start();
+        params.devUp = devUp[i];
+        params.devDown = devDown[i];
+        params.devRight = devRight[i];
+        params.devLeft = devLeft[i];
+
+        Ptr<SatelliteForwardingApp> app = CreateObject<SatelliteForwardingApp>();
+        app->Setup(params);
+        node->AddApplication(app);
+        app->SetStartTime(Seconds(0.0));
+        app->SetStopTime(Seconds(simDurationS));
+        apps[i] = PeekPointer(app);
     }
 
-    // ── 8. Run ────────────────────────────────────────────────────────────────
-    Simulator::Stop (Seconds (simDurationS));
-    Simulator::Run ();
-    Simulator::Destroy ();
+    // ── Ring switches ────────────────────────────────────────────────────────
+    RingSwitchScheduler ringScheduler(params.constellation, satsPerOrbit, numOrbits, nodes, rightPartner, apps);
+    ringScheduler.ScheduleSwitches(simDurationS);
+
+    // ── Run ──────────────────────────────────────────────────────────────────
+    Simulator::Stop(Seconds(simDurationS));
+    Simulator::Run();
+    Simulator::Destroy();
 
 #ifdef NS3_MPI
-    MpiInterface::Disable ();
+    MpiInterface::Disable();
 #endif
 
     if (systemId == 0)
+    {
         std::cout << "[StorageInSpace] Done." << std::endl;
-
+    }
     return 0;
 }

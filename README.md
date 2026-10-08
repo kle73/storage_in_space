@@ -30,11 +30,11 @@ the system packages listed under Build, nothing has to be downloaded or copied.
         │   ├── satellite_network/          this project's ns-3 module
         │   │   ├── CMakeLists.txt          list of the module's source files
         │   │   └── model/
-        │   │       ├── satellite-forwarding-app.*   per-satellite app: queues, packet records, statistics, output files
-        │   │       ├── strategy-interfaces.h        base classes RoutingStrategy / ContentStrategy
-        │   │       ├── routing/                     ring-switch-walker-star, ring-switch-walker-delta
-        │   │       ├── content/                     fill-double
-        │   │       ├── ring-switch-scheduler.*      computes and fires the ring switches
+        │   │       ├── satellite-forwarding-app.*   per-satellite app: queues, storage levels, packet records, statistics, output files
+        │   │       ├── strategy-interfaces.h        base classes RoutingStrategy / ContentStrategy, packet types
+        │   │       ├── routing/                     ring-switch-walker-star, ring-switch-walker-delta (incl. broadcast algorithms)
+        │   │       ├── content/                     fill-double (object generation for storage and broadcast)
+        │   │       ├── ring-switch-scheduler.*      computes and starts the ring switches
         │   │       ├── constellation-config.*       initial ring rows and seam satellites per constellation
         │   │       └── point-to-point-laser-*       laser ISL device / channel / helper (from Hypatia, device modified)
         │   └── nr, lorawan, oran, ...      modules bundled with ns-allinone-3.45 (not used by this project)
@@ -132,60 +132,69 @@ All arguments below can be added inside the quotes.
 | `--tleDir` | `scratch/satellite-simulation-data` | folder containing the TLE files (relative to the run folder or absolute) |
 | `--outDir` | `mysim_results` | output folder, relative to the run folder or absolute (printed at start) |
 | `--routingAlgorithm` | `ring-switch-walker-star` | `ring-switch-walker-star` (Iridium) or `ring-switch-walker-delta` (Starlink) |
-| `--contentGeneration` | `fill-double` | `fill-double` (only option) |
+| `--contentGeneration` | `fill-double` | `fill-double` (storage: two copies per object) or `broadcast` (every object is sent to all satellites) |
+| `--broadcastAlgorithm` | `prune` | broadcast algorithm of `ring-switch-walker-delta`: `prune` (flooding with reverse-path pruning), `flood`, `dim-order` (dimension-ordered spanning tree), `spt` (delay-optimal shortest-path trees); walker-star always floods |
 | `--simDur` | `40` | simulated time [s] |
 | `--islQueue` | `4000` | ISL queue size [packets] |
 | `--islRate` | `80000` | ISL data rate [Mbps] |
-| `--inclination` | `86.4` | orbit inclination [deg] |
-| `--maxQueueFillLevel` | `1` | queue fill limit in % of `--islQueue` |
+| `--maxQueueFillLevel` | `1` | fill level of the storage queues in % of `--islQueue` |
+| `--objectSize` | `10` | packets per object |
+| `--ttl` | `10000` | time to live of stored objects [s]; expired copies are replaced or deleted by their origin |
 | `--trafficShare` | `2` | TDMA slots per period for the data (storage) queue of each laser device. Slots of the other queue stay idle when it has nothing to send, so storage traffic gets `trafficShare/(trafficShare+trafficShareBroadcast)` of `--islRate` |
 | `--trafficShareBroadcast` | `1` | TDMA slots per period for the broadcast queue; `0` gives the whole link to the data queue (only for runs without broadcast traffic) |
 | `--numRanksPerOrbit` | `2` | MPI ranks per orbit |
 | `--nullmsg` | `true` | MPI synchronisation: null-message (`true`) or distributed (`false`) |
 | `--runNumber` | `0` | appended to the output file names (`...S<runNumber>.csv`) |
 | `--forceStatic` | `false` | keep satellites at their initial positions |
-| `--useBackpressure`, `--statistics` | | currently unused |
+| `--useBackpressure`, `--inclination`, `--statistics` | | accepted for older run scripts, not used |
 
 ## Output (below `--outDir`)
 
 | File | Content |
 |---|---|
 | `queue_stats/experiment4/queue_statisticsS<run>.csv` | queue lengths per satellite and direction |
-| `packet_stats/experiment4/packet_statisticsS<run>.txt` | per satellite: own packets alive, packets created, mean RTT of the interval (time between two returns of the same copy; 10.0 = none yet), dropped, missing |
-| `packet_stats/experiment4/packet_reassembleS<run>.csv` | object reassembly events |
-| `packet_stats/packet_monitoring_dataFix.csv` | unroutable packets |
-| `packet_stats/spt_tree.csv` | shortest-path tree (walker-delta only) |
-| `flow_analysis/experiment3/flow_dataS<run>.csv` | per-link in/out/drop counters |
-| `broadcast/experiment4/broadcast_statsS<run>.csv` | broadcast reception times |
-| `object_duplication/experiment4/obj_injectS<run>.csv`, `obj_dupS<run>.csv` | object insertion / second copies |
-| `content/content_stats.csv`, `debug/debug_out.csv` | content and debug log |
-| `positions/position_data.csv`, `positions/isl_connections.csv` | positions, ISL topology |
+| `packet_stats/experiment4/packet_statisticsS<run>.txt` | per satellite (no header): node, time, own packets in the system, packet ids created, mean RTT of the interval (time between two passes of the same copy; 10.0 = none yet), dropped (cumulative), missing (no copy seen for 6.2 s and for twice the longest RTT), copies that arrived after their record was evicted |
+| `packet_stats/experiment4/packet_reassembleS<run>.csv` | a flagged single copy returned to its origin |
+| `packet_stats/packet_monitoring_dataFix.csv` | unroutable packets (node, last hop, time, code) |
+| `packet_stats/spt_tree.csv` | tree of satellite 0 after every rebuild (walker-delta, `--broadcastAlgorithm=spt`) |
+| `broadcast/experiment4/broadcast_statsS<run>.csv` | send and reception times of a 1 % sample of the broadcasts |
+| `object_duplication/experiment4/obj_injectS<run>.csv`, `obj_dupS<run>.csv` | object insertions (mode 0: both copies, 1: UP copy only, 2: DOWN copy only) / second copies |
+| `positions/isl_connections.csv` | ISL topology |
 
 Missing folders are created automatically. `std_out.txt` (console output) is
 written there by the run scripts, not by the program. Result files are not
 versioned (`.gitignore`).
 
-## Compile-time switches
+## Storage mechanism (overview)
 
-Paths relative to `contrib/satellite_network/model/`. Change, then
-`./ns3 build`.
+Every object is stored as an UP and a DOWN copy that circulate in the storage
+rings. Each satellite has a level for its up queue and its down queue: the
+level becomes active the first time the queue is full, and from then on the
+routing tops the queue up to its level with dummy packets (they only add
+queueing delay and are dropped by the next satellite). New objects are stored
+whenever the levels admit them and no ring switch is near; a copy whose time to
+live (`--ttl`) has expired is replaced by a copy of a waiting object, or
+deleted, by its origin. The stored amount therefore stays constant once all
+levels are active. Details: class comment of `SatelliteForwardingApp` and the
+overview comments at the top of the two routing files.
 
-| Where | Switches |
-|---|---|
-| `satellite-forwarding-app.h` | `MONITORE_GENERAL` (queue/packet stats), `MONITORE_POSITIONS`, `MONITORE_PACKET` (per-hop log, slow), `MONITORE_FLOW_BALANCE`, `QUEUE_BUFFER`, `QUEUE_BUFFER_RING` |
-| `content/content-fill-double.h` | `STORAGE_FILL_PHASE_END_S`, `FREEZE_AFTER_FIRST_DOWN_SWITCH`, `TIME_TO_LIVE`, `GENERATION_START_TIME`, `SWITCH_SAFETY_TIMEOUT` |
-| `routing/routing-ring-switch-walker-star.cc` | `DOWN_QUEUE_REGULATION`, `STORAGE_FILL_PHASE_END_S` (keep equal to the content one) |
+There are no compile-time switches. Tuning constants (queue headroom, switch
+guard, statistics interval, ...) are named constants at the top of the source
+files in `contrib/satellite_network/model/`.
 
 ## Extending
 
 - **New routing or content strategy:** derive from `RoutingStrategy` /
-  `ContentStrategy` (`model/strategy-interfaces.h`; `Init`, `OnReceive` /
-  `Generate`), map its name in `SatelliteForwardingApp::SetupWithDevices`
-  (`model/satellite-forwarding-app.cc`) and in the name check in
-  `scratch/storage_in_space.cc`, include its header in
-  `model/satellite-forwarding-app.h` and add the files to
+  `ContentStrategy` (`model/strategy-interfaces.h`), map its name in
+  `SatelliteForwardingApp::Setup` and include its header
+  (`model/satellite-forwarding-app.cc`), extend the name check in
+  `scratch/storage_in_space.cc` and add the files to
   `contrib/satellite_network/CMakeLists.txt`. Write output files via
   `SatelliteForwardingApp::OutputPath("folder/file.csv")`.
+- **New broadcast algorithm (walker-delta):** derive from
+  `DeltaBroadcastAlgorithm` (`model/routing/routing-ring-switch-walker-delta.h`)
+  in `routing-ring-switch-walker-delta.cc` and add one line with its name to
+  `kBroadcastAlgorithms` there; `--broadcastAlgorithm=<name>` then selects it.
 - **New constellation:** add `tle-<name>.txt` to
   `scratch/satellite-simulation-data/` (first line
   `<orbits> <satellites per orbit>`, then the TLEs grouped by orbit and sorted
@@ -193,8 +202,9 @@ Paths relative to `contrib/satellite_network/model/`. Change, then
   entry in `MakeConstellationConfig` (`model/constellation-config.cc`) with the
   initial ring rows and seam satellites.
 
-More on the ring-switch routing: the overview comment at the top of
-`model/routing/routing-ring-switch-walker-star.cc`.
+More on the ring-switch routing: the overview comments at the top of
+`model/routing/routing-ring-switch-walker-star.cc` and
+`model/routing/routing-ring-switch-walker-delta.cc`.
 
 ## Acknowledgements
 

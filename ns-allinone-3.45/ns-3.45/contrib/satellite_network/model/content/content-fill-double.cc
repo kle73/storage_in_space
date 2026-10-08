@@ -1,297 +1,270 @@
 #include "content-fill-double.h"
 
-#include "ns3/simulator.h"
-#include "ns3/queue.h"
-#include "ns3/point-to-point-laser-net-device.h"
 #include "../satellite-forwarding-app.h"
 
-#include "ns3/node.h"
-#include "ns3/mobility-model.h"
-#include <cmath>
-#include <cstdio>
+#include "ns3/point-to-point-laser-net-device.h"
+#include "ns3/queue.h"
+#include "ns3/simulator.h"
 
-namespace ns3 {
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
 
+namespace ns3
+{
+
+namespace
+{
+
+/// Objects are generated in random intervals of 2 to 12 us (one try per interval).
+constexpr int64_t kGenerationIntervalMinUs = 2;
+constexpr uint32_t kGenerationIntervalSpreadUs = 10;
+/// Polling intervals of the insertion [us]: next object; retry while the
+/// queues are filling; retry while the levels are exhausted or around a ring
+/// switch (the levels only change when copies are deleted).
+constexpr int64_t kInsertIntervalUs = 10;
+constexpr int64_t kRetryIntervalUs = 20;
+constexpr int64_t kIdleRetryIntervalUs = 1000;
+/// Objects that cannot be stored wait in a list of at most this many objects;
+/// further objects are rejected.
+constexpr std::size_t kMaxPendingObjects = 1000;
+/// Packet ids are 32 bit: stop generating before they run out.
+constexpr uint64_t kMaxPacketIds = 4100000000ULL;
+/// Broadcasts: fraction (percent) sampled for the delivery statistics, from this time on [s].
+constexpr uint32_t kBroadcastSamplePercent = 1;
+constexpr double kBroadcastSampleStart = 1.5;
+
+} // namespace
+
+ContentFillDouble::ContentFillDouble(Mode mode)
+    : m_mode(mode)
+{
+}
+
+void
+ContentFillDouble::Init(SatelliteForwardingApp* app)
+{
+    m_app = app;
+    if (m_mode == Mode::STORAGE)
+    {
+        m_app->SetReplacementSource([this](direction_t direction, SatPacketHeader& header) {
+            return TakeReplacementCopy(direction, header);
+        });
+    }
+}
+
+void
+ContentFillDouble::Generate()
+{
+    const uint32_t offset = m_app->GetRandom()->GetInteger(0, kGenerationIntervalSpreadUs);
+    Simulator::Schedule(MicroSeconds(10 + offset), &ContentFillDouble::GenerateObject, this);
+    Simulator::Schedule(MilliSeconds(10), &ContentFillDouble::SendObject, this);
+}
+
+void
+ContentFillDouble::GenerateObject()
+{
+    // every try creates an object with probability 1 / number of satellites
+    const uint32_t roll = m_app->GetRandom()->GetInteger(0, m_app->GetNumSatellites() - 1);
+    if (roll < 1 && m_pending.size() < kMaxPendingObjects)
+    {
+        m_pending.push_back({m_app->AllocateObjectId(), m_app->GetObjectSize()});
+        m_numPendingPackets += m_app->GetObjectSize();
+    }
+
+    if (m_app->GetNumAllocatedPacketIds() + m_numPendingPackets < kMaxPacketIds)
+    {
+        const uint32_t offset = m_app->GetRandom()->GetInteger(0, kGenerationIntervalSpreadUs);
+        Simulator::Schedule(MicroSeconds(kGenerationIntervalMinUs + offset),
+                            &ContentFillDouble::GenerateObject,
+                            this);
+    }
+    else
+    {
+        m_generationStopped = true;
+    }
+}
+
+void
+ContentFillDouble::SendObject()
+{
+    if (m_app->IsInSwitchGuard())
+    {
+        Simulator::Schedule(MicroSeconds(kIdleRetryIntervalUs), &ContentFillDouble::SendObject, this);
+        return;
+    }
+    if (m_pending.empty())
+    {
+        if (!m_generationStopped)
+        {
+            Simulator::Schedule(MicroSeconds(kInsertIntervalUs), &ContentFillDouble::SendObject, this);
+        }
+        return;
+    }
+
+    const PendingObject object = m_pending.front();
+    if (m_mode == Mode::BROADCAST)
+    {
+        BroadcastObject(object);
+    }
+    else if (!InsertObject(object))
+    {
+        const bool levelsActive = m_app->IsLevelActive(UP) && m_app->IsLevelActive(DOWN);
+        Simulator::Schedule(MicroSeconds(levelsActive ? kIdleRetryIntervalUs : kRetryIntervalUs),
+                            &ContentFillDouble::SendObject,
+                            this);
+        return;
+    }
+    m_pending.pop_front();
+    m_numPendingPackets -= object.numPackets;
+    Simulator::Schedule(MicroSeconds(m_mode == Mode::BROADCAST ? kRetryIntervalUs : kInsertIntervalUs),
+                        &ContentFillDouble::SendObject,
+                        this);
+}
+
+bool
+ContentFillDouble::InsertObject(const PendingObject& object)
+{
+    const SatelliteForwardingApp::Admission admission = m_app->AdmitObject(object.numPackets);
+    if (admission == SatelliteForwardingApp::Admission::NONE)
+    {
+        return false;
+    }
+    const bool up = admission != SatelliteForwardingApp::Admission::DOWN_ONLY;
+    const bool down = admission != SatelliteForwardingApp::Admission::UP_ONLY;
+
+    // a single copy is flagged so that the routing creates the second one
+    const uint16_t dupCode = (up && down) ? 0 : 1;
+    Ptr<NetDevice> devUp = m_app->GetDevUp();
+    Ptr<NetDevice> devDown = m_app->GetDevDown();
+    for (uint32_t i = 0; i < object.numPackets; i++)
+    {
+        const uint32_t id = m_app->AllocatePacketId();
+        if (up)
+        {
+            Ptr<Packet> packet = MakeFragment(object.id, i, UP, m_app->GetInsertionEpoch(UP), dupCode, id);
+            devUp->Send(packet, devUp->GetBroadcast(), SatelliteForwardingApp::kProtocolData);
+        }
+        if (down)
+        {
+            Ptr<Packet> packet =
+                MakeFragment(object.id, i, DOWN, m_app->GetInsertionEpoch(DOWN), dupCode, id);
+            devDown->Send(packet, devDown->GetBroadcast(), SatelliteForwardingApp::kProtocolData);
+        }
+    }
+    m_app->LogObjectInsertion(object.id, object.numPackets, (up && down) ? 0 : (up ? 1 : 2));
+    return true;
+}
+
+bool
+ContentFillDouble::TakeReplacementCopy(direction_t direction, SatPacketHeader& header)
+{
+    const int index = (direction == DOWN) ? 1 : 0;
+    // the oldest object that still lacks a copy of this direction, or a new one
+    auto object = std::find_if(m_replacing.begin(), m_replacing.end(), [index](const ReplacingObject& o) {
+        return o.numStored[index] < o.numPackets;
+    });
+    if (object == m_replacing.end())
+    {
+        if (m_pending.empty())
+        {
+            return false;
+        }
+        const PendingObject pending = m_pending.front();
+        m_pending.pop_front();
+        m_numPendingPackets -= pending.numPackets;
+        ReplacingObject replacing{pending.id,
+                                  pending.numPackets,
+                                  m_app->GetNumAllocatedPacketIds(),
+                                  static_cast<uint64_t>(Simulator::Now().GetMilliSeconds()),
+                                  {0, 0}};
+        for (uint32_t i = 0; i < pending.numPackets; i++)
+        {
+            m_app->AllocatePacketId();
+        }
+        m_app->LogObjectInsertion(pending.id, pending.numPackets, 0);
+        m_replacing.push_back(replacing);
+        object = std::prev(m_replacing.end());
+    }
+
+    const uint32_t fragment = object->numStored[index]++;
+    header.SetId(object->firstPacketId + fragment);
+    header.SetOrigin(m_app->GetSatId());
+    header.SetCreationTimeMs(object->creationTimeMs);
+    header.SetTtl(m_app->GetObjectTtl());
+    header.SetObjectId(object->id);
+    header.SetFragmentId(fragment);
+    header.SetDupCode(0);
+
+    while (!m_replacing.empty() && m_replacing.front().numStored[0] == m_replacing.front().numPackets &&
+           m_replacing.front().numStored[1] == m_replacing.front().numPackets)
+    {
+        m_replacing.pop_front();
+    }
+    return true;
+}
+
+void
+ContentFillDouble::BroadcastObject(const PendingObject& object)
+{
+    const uint32_t firstId = m_app->GetNumAllocatedPacketIds();
+    for (uint32_t i = 0; i < object.numPackets; i++)
+    {
+        m_app->AllocatePacketId();
+    }
+
+    // A small sample of the broadcasts is logged at every satellite it reaches.
+    bool sampled = false;
+    if (Simulator::Now().GetSeconds() >= kBroadcastSampleStart)
+    {
+        sampled = m_app->GetRandom()->GetInteger(0, 100) < kBroadcastSamplePercent;
+    }
+
+    // The routing chooses the first hops; an object is only sent on a link
+    // whose broadcast queue has room for all of it.
+    for (Ptr<NetDevice> device : m_app->GetBroadcastFirstHops())
+    {
+        Ptr<Queue<Packet>> queue = DynamicCast<PointToPointLaserNetDevice>(device)->GetBroadcastQueue();
+        const int64_t space = static_cast<int64_t>(m_app->GetFillLevel()) -
+                              static_cast<int64_t>(queue->GetCurrentSize().GetValue());
+        if (space <= 0 || static_cast<int64_t>(object.numPackets) > space)
+        {
+            continue;
+        }
+        for (uint32_t i = 0; i < object.numPackets; i++)
+        {
+            Ptr<Packet> packet = MakeFragment(object.id, i, BROADCAST, 0, sampled ? 1 : 0, firstId + i);
+            device->Send(packet, device->GetBroadcast(), SatelliteForwardingApp::kProtocolBroadcast);
+            if (sampled)
+            {
+                m_app->LogBroadcast(true, m_app->GetSatId(), firstId + i);
+            }
+        }
+    }
+}
 
 Ptr<Packet>
-ContentFillDouble::MakeFragment (uint32_t obj_id,
-                                 uint32_t frag_id,
-                                 uint16_t direction,
-                                 uint32_t epoch,
-                                 uint16_t dup_code,
-                                 uint32_t id)
+ContentFillDouble::MakeFragment(uint32_t objectId,
+                                uint32_t fragmentId,
+                                direction_t direction,
+                                uint32_t epoch,
+                                uint16_t dupCode,
+                                uint32_t id) const
 {
-    Ptr<Packet> pkt = Create<Packet> (SatelliteForwardingApp::maxPayloadSize);
-    RingSwitchStarHeader hdr;
-    hdr.SetId       (id);
-    hdr.SetSat      (m_app->GetSatId ());
-    hdr.SetTime     (Simulator::Now().GetMilliSeconds());
-    hdr.SetTTL      (TIME_TO_LIVE);
-    hdr.SetDirection(direction);
-    hdr.SetEpoch    (epoch);
-    hdr.SetObjId    (obj_id);
-    hdr.SetFragId   (frag_id);
-    hdr.SetLastHop  (m_app->GetSatId()); 
-    hdr.SetDupCode  (dup_code);
-    pkt->AddHeader (hdr);
-    return pkt;
+    Ptr<Packet> packet = Create<Packet>(SatelliteForwardingApp::kPayloadSize);
+    SatPacketHeader header;
+    header.SetId(id);
+    header.SetOrigin(m_app->GetSatId());
+    header.SetCreationTimeMs(Simulator::Now().GetMilliSeconds());
+    header.SetTtl(m_app->GetObjectTtl());
+    header.SetDirection(direction);
+    header.SetEpoch(epoch);
+    header.SetObjectId(objectId);
+    header.SetFragmentId(fragmentId);
+    header.SetLastHop(m_app->GetSatId());
+    header.SetDupCode(dupCode);
+    packet->AddHeader(header);
+    return packet;
 }
-
-void ContentFillDouble::GenerateBroadcastPacket (uint32_t obj_id, uint32_t num_packets, uint32_t curr_id)
-{
-    Ptr<NetDevice> devs[4] = { m_app->GetDevUp (),   m_app->GetDevDown (),
-                               m_app->GetDevLeft (), m_app->GetDevRight () };
-
-    const uint32_t base = curr_id;   // shared id block for this object
-
-    uint16_t monitore = 0;
-    if (Simulator::Now().GetSeconds() >= 1.5){
-        uint32_t roll = m_app->uniform_rnd->GetInteger(0, 100);
-        if (roll < 1){
-            monitore = 1;
-        }
-    }
-
-    for (Ptr<NetDevice> dev : devs)
-    {
-        if (!dev) continue;
-
-        if (dev == m_app->GetDevLeft() || dev == m_app->GetDevRight()){
-
-            if (m_app->isSeamLeft && dev == m_app->GetDevLeft()) continue;
-            if (m_app->isSeamRight && dev == m_app->GetDevRight()) continue;
-
-            Ptr<MobilityModel> mob = m_app->GetNode ()->GetObject<MobilityModel> ();
-            Vector pos = mob->GetPosition ();
-            double lat = std::asin (pos.z / std::sqrt (pos.x*pos.x + pos.y*pos.y + pos.z*pos.z));
-            if (std::abs(lat) > 60.0 * M_PI / 180.0) continue;
-        }
-
-        Ptr<Queue<Packet>> bq =
-            DynamicCast<PointToPointLaserNetDevice> (dev)->GetBroadcastQueue ();
-
-        int64_t space = (int64_t) m_app->GetMaxIslQueueFillLevel ()
-                      - (int64_t) bq->GetCurrentSize ().GetValue ();
-        if ((int64_t) num_packets > space || space <= 0) continue;
-        for (uint32_t i = 0; i < num_packets; i++)
-        {
-            Ptr<Packet> pkt = MakeFragment (obj_id, i, BROADCAST, 0, monitore, base + i);
-            dev->Send (pkt, dev->GetBroadcast (),
-                       SatelliteForwardingApp::PROTO_BROADCAST);
-            if (monitore){
-                FILE* f = fopen(m_app->filename_broadcast_stats, "a");
-                if (f) {
-                    uint32_t sat_id = m_app->GetSatId();
-                    fprintf(f, "1,%u,%u,%lu,%lf\n", sat_id, sat_id, base+i, Simulator::Now().GetSeconds());
-                    fclose(f);
-                }
-            }
-        }
-    }
-
-}
-
-
-// ── Generate ─────────────────────────────────────────────────────────────────
-void ContentFillDouble::Generate ()
-{
-
-    // <output folder>/content/content_stats.csv (SatelliteForwardingApp::OutputPath)
-    SatelliteForwardingApp::OutputPath ("content/content_stats.csv",
-                                        filename_content_stats, sizeof (filename_content_stats));
-    if (m_app->GetSatId() == 0){
-        FILE* f = fopen (filename_content_stats,"w");
-        if (f) { fprintf (f, "is_sender,node,id,time\n"); fclose (f); }
-    }
-
-    uint32_t offset = m_app->uniform_rnd->GetInteger (0, 10);
-    Simulator::Schedule (Seconds(GENERATION_START_TIME) + MicroSeconds (10 + offset),
-                        &ContentFillDouble::GenerateObject, this);
-    Simulator::Schedule (Seconds(GENERATION_START_TIME) + MilliSeconds (10),
-                        &ContentFillDouble::SendObject, this);
-}
-
-// ── GenerateObject ───────────────────────────────────────────────────────────
-void ContentFillDouble::GenerateObject ()
-{
-    uint32_t roll = m_app->uniform_rnd->GetInteger (0, m_app->GetNumSatellites () - 1);
-    // periodic storage: do not queue up objects the frozen budget will never
-    // admit (pending_objects would otherwise grow without bound)
-    if (roll < 1 && !(m_budgetFrozen && m_app->GetNumLiveRecords() >= m_storageBudget)) {
-        uint32_t obj_packet_count = m_app->obj_size / SatelliteForwardingApp::maxPayloadSize;
-        pending_objects.push_back (
-            std::make_pair (m_app->current_obj_id, obj_packet_count));
-            m_app->current_obj_id++;
-        m_numPendingPackets += obj_packet_count;
-    }
-                                                                // oneweb: 160000
-    if (m_app->current_packet_id + m_numPendingPackets < 4100000000) {
-        uint32_t offset = m_app->uniform_rnd->GetInteger (0, 10); 
-        Simulator::Schedule (MicroSeconds (2 + offset),                 // CHANGE
-                            &ContentFillDouble::GenerateObject, this);
-    } else {
-        m_app->stop_generating_objects = true;
-    }
-}
-
-// ── SendObject ───────────────────────────────────────────────────────────────
-void ContentFillDouble::SendObject ()
-{
-    // Switch blackout: no new packets from 1 s before until
-    // SWITCH_SAFETY_TIMEOUT after every ring switch.
-    for (const auto& t_fire : m_app->switch_times){
-        if (Simulator::Now().GetSeconds() >= t_fire - 1 && 
-            Simulator::Now().GetSeconds() < t_fire + SWITCH_SAFETY_TIMEOUT) {
-                Simulator::Schedule (MicroSeconds(20), &ContentFillDouble::SendObject, this);
-                return;
-        }
-    }
-
-    // Fixed storage budget (periodic operation), see content-fill-double.h:
-    // freeze the number of own live records once the fill phase is over and,
-    // with FREEZE_AFTER_FIRST_DOWN_SWITCH, the first DOWN switch has settled.
-    // m_currDownEpoch is set by the routing to the epoch of the last DOWN
-    // packet this satellite forwarded (>= 1 once the first DOWN switch reached it).
-    if (!m_budgetFrozen && Simulator::Now().GetSeconds() >= STORAGE_FILL_PHASE_END_S) {
-        bool freezeNow = true;
-#if FREEZE_AFTER_FIRST_DOWN_SWITCH
-        // wait until the first DOWN switch has settled (see content-fill-double.h)
-        // (no scheduled switches at all -> freeze at STORAGE_FILL_PHASE_END_S)
-        if (m_firstDownSwitchSeenAt < 0 && m_app->m_currDownEpoch >= 1)
-            m_firstDownSwitchSeenAt = Simulator::Now().GetSeconds();
-        // (closed Walker-Delta rings: freeze at STORAGE_FILL_PHASE_END_S, see
-        //  content-fill-double.h)
-        if (!m_app->switch_times.empty() && !m_app->GetTopoConfig().closedRing)
-            freezeNow = m_firstDownSwitchSeenAt >= 0 &&
-                        Simulator::Now().GetSeconds() >= m_firstDownSwitchSeenAt + FIRST_DOWN_SWITCH_SETTLE_S;
-#endif
-        if (freezeNow) {
-            m_storageBudget = m_app->GetNumLiveRecords();
-            m_budgetFrozen  = true;
-        }
-    }
-
-    if (!pending_objects.empty()) {
-        auto [obj_id, obj_pkt_count] = pending_objects.front ();
-
-        if (m_budgetFrozen && m_app->GetNumLiveRecords() + obj_pkt_count > m_storageBudget) {
-            // budget exhausted: only replace packets once own records expire (TTL)
-            Simulator::Schedule (MilliSeconds (1), &ContentFillDouble::SendObject, this);
-            return;
-        }
-        Ptr<NetDevice> dev_up = m_app->GetDevUp(); 
-        Ptr<NetDevice> dev_down = m_app->GetDevDown(); 
-        uint32_t base_id = m_app->current_packet_id;
-
-// NEW !!!
-        // for (uint32_t i = 0; i < obj_pkt_count; i++) {
-            // uint32_t id = m_app->AllocatePacketId();
-        // }
-        // GenerateBroadcastPacket(obj_id, obj_pkt_count, base_id);
-        // pending_objects.pop_front ();
-        // m_numPendingPackets -= obj_pkt_count;
-
-        // Simulator::Schedule (MicroSeconds (20), &ContentFillDouble::SendObject, this);
-        // return;
-// NEW END !!!
-
-        // Admission: an object enters a queue only if the whole object fits
-        // below the fill level (GetMaxIslQueueFillLevel) of that queue.
-        // Ptr<NetDevice> device = m_app->GetDevUp();
-        Ptr<Queue<Packet>> q_up =
-            DynamicCast<PointToPointLaserNetDevice> (dev_up)->GetQueue ();
-        Ptr<Queue<Packet>> q_down =
-            DynamicCast<PointToPointLaserNetDevice> (dev_down)->GetQueue ();
-
-
-        int64_t numPackets_qup = (int64_t)q_up->GetCurrentSize ().GetValue ();
-        int64_t numPackets_qdown = (int64_t)q_down->GetCurrentSize ().GetValue ();
-
-        int64_t space_left_up = (int64_t)m_app->GetMaxIslQueueFillLevel() - numPackets_qup;
-        int64_t space_left_down = (int64_t)m_app->GetMaxIslQueueFillLevel() - numPackets_qdown;
-        // no admission into a direction the routing has closed
-        // (Walker-Delta kink orbit, see SatelliteForwardingApp::m_noInjectUp)
-        if (m_app->m_noInjectUp)   space_left_up   = 0;
-        if (m_app->m_noInjectDown) space_left_down = 0;
-
-
-        // only the UP queue has space: UP copy only, flagged (dup_code 1)
-        if ((int64_t)obj_pkt_count <= space_left_up && space_left_up > 0 &&
-            !((int64_t)obj_pkt_count <= space_left_down && space_left_down > 0)) {
-
-            for (uint32_t i = 0; i < obj_pkt_count; i++) {
-                uint32_t id = m_app->AllocatePacketId();
-                Ptr<Packet> pkt_up = MakeFragment(obj_id, i, UP, m_app->m_currUpEpoch, 1, id);
-                dev_up->Send (pkt_up, dev_up->GetBroadcast (), SatelliteForwardingApp::PROTO);
-            }
-
-            { FILE* f = fopen(m_app->filename_obj_inject,"a");
-              if (f){ fprintf(f,"%lf,%u,%u,%u,1\n", Simulator::Now().GetSeconds(),
-                              m_app->GetSatId(), obj_id, obj_pkt_count); fclose(f); } }
-            pending_objects.pop_front ();
-            m_numPendingPackets -= obj_pkt_count;
-
-
-        // only the DOWN queue has space: DOWN copy only, flagged (dup_code 1)
-        } else if (!((int64_t)obj_pkt_count <= space_left_up && space_left_up > 0) &&
-            (int64_t)obj_pkt_count <= space_left_down && space_left_down > 0){
-
-            for (uint32_t i = 0; i < obj_pkt_count; i++) {
-                uint32_t id = m_app->AllocatePacketId();
-                Ptr<Packet> pkt_down = MakeFragment(obj_id, i, DOWN, m_app->m_currDownEpoch, 1, id);
-                dev_down->Send (pkt_down, dev_down->GetBroadcast (), SatelliteForwardingApp::PROTO);
-            }
-
-            { FILE* f = fopen(m_app->filename_obj_inject,"a");
-              if (f){ fprintf(f,"%lf,%u,%u,%u,2\n", Simulator::Now().GetSeconds(),
-                              m_app->GetSatId(), obj_id, obj_pkt_count); fclose(f); } }
-
-            pending_objects.pop_front ();
-            m_numPendingPackets -= obj_pkt_count;
-
-        // both queues have space: both copies (dup_code 0)
-        } else if ((int64_t)obj_pkt_count <= space_left_up && space_left_up > 0 &&
-            (int64_t)obj_pkt_count <= space_left_down && space_left_down > 0)
-        {
-            for (uint32_t i = 0; i < obj_pkt_count; i++) {
-                uint32_t id = m_app->AllocatePacketId();
-                Ptr<Packet> pkt_up = MakeFragment(obj_id, i, UP, m_app->m_currUpEpoch, 0, id);
-                Ptr<Packet> pkt_down = MakeFragment(obj_id, i, DOWN, m_app->m_currDownEpoch, 0, id);
-                dev_up->Send (pkt_up, dev_up->GetBroadcast (), SatelliteForwardingApp::PROTO);
-                dev_down->Send (pkt_down, dev_down->GetBroadcast (), SatelliteForwardingApp::PROTO);
-            }
-
-            { FILE* f = fopen(m_app->filename_obj_inject,"a");
-              if (f){ fprintf(f,"%lf,%u,%u,%u,0\n", Simulator::Now().GetSeconds(),
-                              m_app->GetSatId(), obj_id, obj_pkt_count); fclose(f); } }
-
-            pending_objects.pop_front ();
-            m_numPendingPackets -= obj_pkt_count;
-        }
-        else
-        {
-            // no space in either queue: try again later
-            Simulator::Schedule (MicroSeconds (20), &ContentFillDouble::SendObject, this);
-            return;
-        }
-
-        // GenerateBroadcastPacket(obj_id, obj_pkt_count, base_id);
-    }
-    else if (m_app->stop_generating_objects)
-    {
-        FILE* f = fopen (m_app->filename_debug, "a");
-        if (f) {
-            fprintf (f, "STOP %u,%lf,%u\n",
-                     m_app->GetSatId (),
-                     Simulator::Now ().GetSeconds (),
-                     m_app->current_packet_id);
-            fclose (f);
-        }
-        return; // No more objects ever — stop rescheduling
-    }
-
-    Simulator::Schedule (MicroSeconds (10), &ContentFillDouble::SendObject, this);
-}
-
 
 } // namespace ns3
