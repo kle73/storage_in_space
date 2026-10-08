@@ -4,11 +4,6 @@
 .lock-ns3_*
 compile_commands.json
 
-# ── Simulation output: keep only the empty folder skeleton ──
-/ns-allinone-3.45/ns-3.45/mysim_results/**
-!/ns-allinone-3.45/ns-3.45/mysim_results/**/
-!/ns-allinone-3.45/ns-3.45/mysim_results/**/.gitkeep
-!/ns-allinone-3.45/ns-3.45/mysim_results/README.md
 
 # ── Backups / temporary files ──
 *.bak
