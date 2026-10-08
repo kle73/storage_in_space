@@ -1,0 +1,26 @@
+# Use prebuilt base image with dependencies (you'll maintain this)
+FROM registry.gitlab.com/nitk-surathkal/quantum/base:latest
+
+# Set up working directory
+WORKDIR /workspace
+
+# Clone ns-3-dev repo (if you expect updates, use depth and tag)
+# RUN git clone -b ns-3.45 --depth=1 https://gitlab.com/nsnam/ns-3-dev.git
+
+# Copy quantum module into ns-3-dev (assumes mounted or built-in in image context)
+# COPY . ns-3-dev/contrib/quantum/
+
+# Apply patch safely
+WORKDIR /workspace/ns-3-dev
+RUN git apply --check contrib/quantum/patches/ns-3.45.patch || echo "Patch already applied"
+RUN git apply contrib/quantum/patches/ns-3.45.patch || echo "Skipping patch application"
+
+# Configure and build
+RUN ./ns3 configure --enable-examples --enable-tests --enable-crypto --enable-qpp \
+ && ./ns3 build quantum
+
+# Optional: add version file or build cache metadata
+# RUN echo "Build: $(date)" > build_info.txt
+
+# Set entrypoint for running ns-3 directly
+CMD ["./ns3", "shell"]

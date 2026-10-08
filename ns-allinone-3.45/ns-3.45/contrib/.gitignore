@@ -1,0 +1,4 @@
+# ns-3 ignores everything in contrib/ by default, because contrib modules are
+# usually cloned from separate repositories. This repository ships its contrib
+# modules (satellite_network and the modules bundled with ns-allinone-3.45),
+# so nothing is ignored here. (Only affects git, not the build.)

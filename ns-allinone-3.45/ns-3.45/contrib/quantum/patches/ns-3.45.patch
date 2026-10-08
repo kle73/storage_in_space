@@ -1,0 +1,322 @@
+diff --git a/build-support/3rd-party/FindCryptoPP.cmake b/build-support/3rd-party/FindCryptoPP.cmake
+new file mode 100644
+index 000000000..902cd9a01
+--- /dev/null
++++ b/build-support/3rd-party/FindCryptoPP.cmake
+@@ -0,0 +1,119 @@
++# Copyright (c) 2025
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions are met:
++#
++# * Redistributions of source code must retain the above copyright notice, this
++#   list of conditions, and the following disclaimer.
++# * Redistributions in binary form must reproduce the above copyright notice,
++#   this list of conditions, and the following disclaimer in the documentation
++#   and/or other materials provided with the distribution.
++# * Neither the name of the author nor the names of its contributors may be used
++#   to endorse or promote products derived from this software without specific
++#   prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
++
++#[=======================================================================[.rst:
++FindCryptoPP
++--------------
++
++Find Crypto++ headers and libraries.
++
++Imported Targets
++^^^^^^^^^^^^^^^^
++
++``CryptoPP::CryptoPP``
++  The Crypto++ library, if found.
++
++Result Variables
++^^^^^^^^^^^^^^^^
++
++This will define the following variables in your project:
++
++``CryptoPP_FOUND``
++  True if Crypto++ is found.
++``CryptoPP_VERSION``
++  The version of Crypto++.
++``CryptoPP_LIBRARIES``
++  The libraries to link against to use Crypto++.
++``CryptoPP_INCLUDE_DIRS``
++  Where to find the Crypto++ headers.
++
++#]=======================================================================]
++
++find_package(PkgConfig QUIET)
++pkg_check_modules(PC_CRYPTOPP QUIET libcryptopp) # Corrected module name
++set(CryptoPP_COMPILE_OPTIONS ${PC_CRYPTOPP_CFLAGS_OTHER})
++set(CryptoPP_VERSION ${PC_CRYPTOPP_VERSION})
++
++find_path(
++  CryptoPP_INCLUDE_DIR
++  NAMES cryptlib.h
++  HINTS ${PC_CRYPTOPP_INCLUDEDIR}
++  PATH_SUFFIXES cryptopp
++)
++
++find_library(
++  CryptoPP_LIBRARY NAMES cryptopp libcryptopp HINTS ${PC_CRYPTOPP_LIBDIR}
++)
++
++# Extract Crypto++ version from cryptlib.h
++if(CryptoPP_INCLUDE_DIR AND NOT CryptoPP_VERSION)
++  if(EXISTS "${CryptoPP_INCLUDE_DIR}/cryptlib.h")
++    file(READ "${CryptoPP_INCLUDE_DIR}/cryptlib.h" _cryptopp_version_content)
++    string(REGEX MATCH "#define CRYPTOPP_VERSION ([0-9]+)" _dummy
++                 "${_cryptopp_version_content}"
++    )
++    if(CMAKE_MATCH_1)
++      math(EXPR CryptoPP_VERSION_MAJOR "${CMAKE_MATCH_1} / 100")
++      math(EXPR CryptoPP_VERSION_MINOR "(${CMAKE_MATCH_1} % 100) / 10")
++      math(EXPR CryptoPP_VERSION_PATCH "${CMAKE_MATCH_1} % 10")
++      set(CryptoPP_VERSION
++          "${CryptoPP_VERSION_MAJOR}.${CryptoPP_VERSION_MINOR}.${CryptoPP_VERSION_PATCH}"
++      )
++    endif()
++  endif()
++endif()
++
++if(CryptoPP_INCLUDE_DIR AND CryptoPP_LIBRARY)
++  set(CryptoPP_FOUND TRUE)
++else()
++  set(CryptoPP_FOUND FALSE)
++endif()
++
++if(NOT CryptoPP_FIND_QUIETLY)
++  if(CryptoPP_FOUND)
++    message(
++      STATUS
++        "Found Crypto++: ${CryptoPP_LIBRARY} (version: ${CryptoPP_VERSION})"
++    )
++  else()
++    message(WARNING "Crypto++ not found!")
++  endif()
++endif()
++
++include(FindPackageHandleStandardArgs)
++find_package_handle_standard_args(
++  CryptoPP
++  FOUND_VAR CryptoPP_FOUND
++  REQUIRED_VARS CryptoPP_INCLUDE_DIR CryptoPP_LIBRARY
++  VERSION_VAR CryptoPP_VERSION
++)
++
++if(CryptoPP_FOUND AND NOT TARGET CryptoPP::CryptoPP)
++  add_library(CryptoPP::CryptoPP UNKNOWN IMPORTED GLOBAL)
++  set_target_properties(
++    CryptoPP::CryptoPP
++    PROPERTIES IMPORTED_LOCATION "${CryptoPP_LIBRARY}"
++               INTERFACE_COMPILE_OPTIONS "${CryptoPP_COMPILE_OPTIONS}"
++               INTERFACE_INCLUDE_DIRECTORIES "${CryptoPP_INCLUDE_DIR}"
++  )
++endif()
++
++mark_as_advanced(CryptoPP_INCLUDE_DIR CryptoPP_LIBRARY)
++
++if(CryptoPP_FOUND)
++  set(CryptoPP_LIBRARIES ${CryptoPP_LIBRARY})
++  set(CryptoPP_INCLUDE_DIRS ${CryptoPP_INCLUDE_DIR})
++endif()
+diff --git a/build-support/3rd-party/FindQpp.cmake b/build-support/3rd-party/FindQpp.cmake
+new file mode 100644
+index 000000000..f7e738782
+--- /dev/null
++++ b/build-support/3rd-party/FindQpp.cmake
+@@ -0,0 +1,29 @@
++# * Find Quantum++ (QPP) This module defines: QPP_FOUND       - System has QPP
++#   QPP_INCLUDE_DIR - The QPP include directory QPP_LIBRARIES   - Libraries
++#   needed to use QPP
++
++# Look for QPP include directory
++find_path(QPP_INCLUDE_DIR NAMES qpp/qpp/qpp.hpp
++          PATHS /usr/local/include /usr/include $ENV{QPP_DIR}/include
++                /opt/qpp/include
++)
++
++# if system is Linux, the /qpp has to be added to the include path
++if(UNIX AND NOT APPLE)
++  set(QPP_INCLUDE_DIR ${QPP_INCLUDE_DIR}/qpp)
++endif()
++
++# Handle REQUIRED argument
++include(FindPackageHandleStandardArgs)
++find_package_handle_standard_args(QPP REQUIRED_VARS QPP_INCLUDE_DIR)
++
++# Add QPP include directories to the build
++if(QPP_FOUND)
++  message(STATUS "Found Quantum++: ${QPP_INCLUDE_DIR}")
++  mark_as_advanced(QPP_INCLUDE_DIR)
++else()
++  message(
++    CMAKE_COMPILE_WARNING_AS_ERROR
++    "Quantum++ not found! Set QPP_DIR to the correct path or install Quantum++."
++  )
++endif()
+diff --git a/build-support/custom-modules/ns3-configtable.cmake b/build-support/custom-modules/ns3-configtable.cmake
+index 2a6e987c3..a7a104f00 100644
+--- a/build-support/custom-modules/ns3-configtable.cmake
++++ b/build-support/custom-modules/ns3-configtable.cmake
+@@ -187,6 +187,12 @@ macro(write_configtable)
+   string(APPEND out "Eigen3 support                : ")
+   check_on_or_off("NS3_EIGEN" "ENABLE_EIGEN")
+ 
++  string(APPEND out "Quantum++ support             : ")
++  check_on_or_off("NS3_QPP" "ENABLE_QPP")
++
++  string(APPEND out "Crypto++ support              : ")
++  check_on_or_off("NS3_CRYPTOPP" "ENABLE_CRYPTOPP")
++
+   string(APPEND out "Tap Bridge                    : ")
+   check_on_or_off("ENABLE_TAP" "ENABLE_TAP")
+ 
+diff --git a/build-support/macros-and-definitions.cmake b/build-support/macros-and-definitions.cmake
+index 141540f8a..b16e214d1 100644
+--- a/build-support/macros-and-definitions.cmake
++++ b/build-support/macros-and-definitions.cmake
+@@ -565,6 +565,47 @@ macro(process_options)
+     endif()
+   endif()
+ 
++  set(ENABLE_CRYPTOPP False)
++  if(${NS3_CRYPTOPP})
++    disable_cmake_warnings()
++    find_package(CryptoPP QUIET)
++    enable_cmake_warnings()
++
++    if(${CRYPTOPP_FOUND})
++      set(ENABLE_CRYPTOPP True)
++
++      add_definitions(-DHAVE_CRYPTOPP)
++      if(NOT ${NS3_FORCE_LOCAL_DEPENDENCIES})
++        include_directories(${CryptoPP_INCLUDE_DIRS})
++      endif()
++    else()
++      set(ENABLE_CRYPTOPP_REASON "Crypto++ was not found")
++    endif()
++  endif()
++
++  set(ENABLE_QPP False)
++  if(${NS3_QPP})
++    disable_cmake_warnings()
++    find_package(Eigen3 QUIET)
++    enable_cmake_warnings()
++    if(NOT ${EIGEN3_FOUND})
++      set(ENABLE_QPP_REASON "Eigen3 is required by Quantum++ and was not found")
++    else()
++      disable_cmake_warnings()
++      find_package(Qpp QUIET)
++      enable_cmake_warnings()
++      if(${QPP_FOUND})
++        set(ENABLE_QPP True)
++        add_definitions(-DHAVE_QPP)
++        if(NOT ${NS3_FORCE_LOCAL_DEPENDENCIES})
++          include_directories(${QPP_INCLUDE_DIR})
++        endif()
++      else()
++        set(ENABLE_QPP_REASON "Quantum++ was not found")
++      endif()
++    endif()
++  endif()
++
+   # GTK3 Don't search for it if you don't have it installed, as it take an
+   # insane amount of time
+   set(GTK3_FOUND FALSE)
+diff --git a/ns3 b/ns3
+index 60d3d44bf..c4c232251 100755
+--- a/ns3
++++ b/ns3
+@@ -183,8 +183,10 @@ def parse_args(argv):
+         ),
+         ("build-version", "embedding git changes as a build version during build"),
+         ("clang-tidy", "clang-tidy static analysis"),
++        ("crypto", "the Crypto++ library support"),
+         ("dpdk", "the fd-net-device DPDK features"),
+         ("eigen", "Eigen3 library support"),
++        ("qpp", "Quantum++ library support"),
+         ("examples", "the ns-3 examples"),
+         ("gcov", "code coverage analysis"),
+         ("gsl", "GNU Scientific Library (GSL) features"),
+@@ -889,10 +891,12 @@ def configure_cmake(
+     options = (
+         ("ASSERT", "asserts"),
+         ("CLANG_TIDY", "clang_tidy"),
++        ("CRYPTOPP", "crypto"),
+         ("COVERAGE", "gcov"),
+         ("DES_METRICS", "des_metrics"),
+         ("DPDK", "dpdk"),
+         ("EIGEN", "eigen"),
++        ("QPP", "qpp"),
+         ("ENABLE_BUILD_VERSION", "build_version"),
+         ("ENABLE_SUDO", "sudo"),
+         ("EXAMPLES", "examples"),
+diff --git a/src/stats/model/sqlite-output.cc b/src/stats/model/sqlite-output.cc
+index 2a3ac781e..07931995e 100644
+--- a/src/stats/model/sqlite-output.cc
++++ b/src/stats/model/sqlite-output.cc
+@@ -108,6 +108,19 @@ SQLiteOutput::RetrieveColumn(sqlite3_stmt* stmt, int pos) const
+     return sqlite3_column_double(stmt, pos);
+ }
+ 
++/// @copydoc SQLiteOutput::RetrieveColumn
++template <>
++std::string
++SQLiteOutput::RetrieveColumn(sqlite3_stmt* stmt, int pos) const
++{
++    const char* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, pos));
++    if (text == nullptr)
++    {
++        return "";
++    }
++    return std::string(text);
++}
++
+ template <typename T>
+ bool
+ SQLiteOutput::Bind(sqlite3_stmt* /* stmt */, int /* pos */, const T& /* value */) const
+@@ -188,6 +201,21 @@ SQLiteOutput::Bind(sqlite3_stmt* stmt, int pos, const std::string& value) const
+     return sqlite3_bind_text(stmt, pos, value.c_str(), -1, SQLITE_STATIC) == SQLITE_OK;
+ }
+ 
++//! \copydoc SQLiteOutput::Bind
++template <>
++bool
++SQLiteOutput::Bind(sqlite3_stmt* stmt, int pos, const int128_t& value) const
++{
++    return sqlite3_bind_int64(stmt, pos, value) == SQLITE_OK;
++}
++
++//! \copydoc SQLiteOutput::BindNull
++bool
++SQLiteOutput::BindNull(sqlite3_stmt* stmt, int pos) const
++{
++    return sqlite3_bind_null(stmt, pos) == SQLITE_OK;
++}
++
+ int
+ SQLiteOutput::WaitPrepare(sqlite3* db, sqlite3_stmt** stmt, const std::string& cmd) const
+ {
+diff --git a/src/stats/model/sqlite-output.h b/src/stats/model/sqlite-output.h
+index 423ab62c4..8f629c146 100644
+--- a/src/stats/model/sqlite-output.h
++++ b/src/stats/model/sqlite-output.h
+@@ -109,6 +109,14 @@ class SQLiteOutput : public SimpleRefCount<SQLiteOutput>
+     template <typename T>
+     bool Bind(sqlite3_stmt* stmt, int pos, const T& value) const;
+ 
++    /**
++     * @brief Bind a null value to a sqlite statement
++     * @param stmt Sqlite statement
++     * @param pos Position of the bind argument inside the statement
++     * @return true on success, false otherwise
++     */
++    bool BindNull(sqlite3_stmt* stmt, int pos) const;
++
+     /**
+      * @brief Retrieve a value from an executed statement
+      * @param stmt sqlite statement

@@ -1,0 +1,25 @@
+FROM ubuntu:rolling
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies
+RUN apt update && apt install -y \
+    git cmake ninja-build g++ clang clang-format-18 clang-tidy pkg-config \
+    python3 python3-pip ccache \
+    libcrypto++-dev libeigen3-dev libgsl-dev libssl-dev \
+    sqlite3 libsqlite3-dev
+
+# Install Quantum++
+RUN git clone -b v6.0 https://github.com/vsoftco/qpp.git && \
+    cd qpp && cmake -B build && cmake --build build --target install && cd .. && rm -rf qpp
+
+WORKDIR /workspace
+
+# Link quantum module into ns-3
+RUN git clone -b ns-3.45 https://gitlab.com/nsnam/ns-3-dev.git
+
+# Copy quantum module into ns-3-dev (assumes mounted or built-in in image context)
+COPY . ns-3-dev/contrib/quantum/
+
+# Change working directory
+WORKDIR /workspace/ns-3-dev
