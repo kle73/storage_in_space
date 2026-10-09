@@ -42,7 +42,7 @@ the system packages listed under Build, nothing has to be downloaded or copied.
         │   ├── satellite/                  SGP4 orbit module (satellite.h, SatellitePositionMobilityModel), from Hypatia
         │   ├── mpi/                        ns-3 MPI module with changes for moving satellites (see below)
         │   └── ...                         unmodified ns-3.45 modules
-        └── mysim_results/                  output folder (default of --outDir); only the empty skeleton is versioned
+        └── mysim_results/                  output folder (default of --outDir); 
 ```
 
 Everything else in `ns-3.45/` is unmodified ns-3.45. Changes to ns-3 itself:
