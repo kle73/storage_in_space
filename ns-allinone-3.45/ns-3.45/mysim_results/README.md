@@ -1,9 +1,8 @@
 # mysim_results
 
 Default output folder of `storage_in_space` (`--outDir`, relative to the folder
-the simulation runs in, normally `ns-3.45/`). Only this skeleton is under
-version control; all result files are ignored (see `.gitignore`).
-Missing folders are also created automatically at start-up.
+the simulation runs in, normally `ns-3.45/`).
+Missing folders are created automatically at start-up.
 
 | Folder | Files (`<run>` = `--runNumber`) |
 |---|---|
