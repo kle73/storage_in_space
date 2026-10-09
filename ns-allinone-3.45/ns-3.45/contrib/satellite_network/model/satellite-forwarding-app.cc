@@ -42,10 +42,21 @@ constexpr int64_t kQueueAdjustIntervalMs = 1;
 constexpr double kSwitchGuardBefore = 1.0;
 constexpr double kSwitchGuardAfter = 3.0;
 constexpr double kSwitchGuardAfterClosedRing = 10.0;
+/// The fill period of a ring ends this long after the switch guard of its
+/// first switch [s]: long enough to fill the gaps left by the switch, also
+/// when the switch guard of the other ring follows shortly after (Walker-Delta).
+constexpr double kFillPeriodSettle = 30.0;
 /// Top-ups of at least this many dummies are printed.
 constexpr uint64_t kTopUpLogThreshold = 100;
 /// Broadcast duplicate suppression: ids per origin in the sliding window.
 constexpr uint32_t kBroadcastWindow = 32768;
+
+/// Length of the switch guard after a ring switch [s].
+double
+GetSwitchGuardAfter(const ConstellationConfig& constellation)
+{
+    return constellation.closedRing ? kSwitchGuardAfterClosedRing : kSwitchGuardAfter;
+}
 
 std::string&
 OutputDirStorage()
@@ -521,6 +532,20 @@ SatelliteForwardingApp::IsLevelActive(direction_t direction) const
     return GetStorageLevel(direction).active;
 }
 
+bool
+SatelliteForwardingApp::IsInFillPeriod(direction_t direction) const
+{
+    const double end = m_firstSwitchTime[direction == DOWN ? 1 : 0] + GetSwitchGuardAfter(m_constellation) +
+                       kFillPeriodSettle;
+    return Simulator::Now().GetSeconds() < end;
+}
+
+bool
+SatelliteForwardingApp::IsFilling(direction_t direction) const
+{
+    return !IsLevelActive(direction) || IsInFillPeriod(direction);
+}
+
 void
 SatelliteForwardingApp::ActivateLevelIfFull(direction_t direction)
 {
@@ -538,6 +563,11 @@ SatelliteForwardingApp::RegulateStorageQueue(direction_t direction)
     ActivateLevelIfFull(direction);
     const StorageLevel& storage = GetStorageLevel(direction);
     if (!storage.active || storage.level <= 0)
+    {
+        return;
+    }
+    // A gap in a filling queue is left for new copies (AdmitObject, CreateSecondCopy).
+    if (IsInFillPeriod(direction) && !IsInSwitchGuard() && !IsInsertionBlocked(direction))
     {
         return;
     }
@@ -570,10 +600,9 @@ SatelliteForwardingApp::GetStorageSpace(direction_t direction) const
     const int64_t fill = static_cast<int64_t>(GetFillLevel());
     const int64_t occupancy = static_cast<int64_t>(GetQueueOccupancy(GetStorageDevice(direction)));
     int64_t space = fill - occupancy;
-    const StorageLevel& storage = GetStorageLevel(direction);
-    if (storage.active)
+    if (!IsFilling(direction))
     {
-        space = std::min(space, fill - storage.level);
+        space = std::min(space, fill - GetStorageLevel(direction).level);
     }
     return static_cast<uint64_t>(std::max<int64_t>(space, 0));
 }
@@ -589,16 +618,16 @@ SatelliteForwardingApp::AdmitObject(uint32_t numPackets)
     ActivateLevelIfFull(DOWN);
     const bool up = GetStorageSpace(UP) >= numPackets;
     const bool down = GetStorageSpace(DOWN) >= numPackets;
-    if ((!up && !down) || (IsLevelActive(UP) && IsLevelActive(DOWN) && !(up && down)))
+    if ((!up && !down) || (!IsFilling(UP) && !IsFilling(DOWN) && !(up && down)))
     {
         return Admission::NONE;
     }
+    // A filling queue keeps its level: the new copies fill a gap below it.
     for (direction_t direction : {UP, DOWN})
     {
-        StorageLevel& storage = GetStorageLevel(direction);
-        if ((direction == UP ? up : down) && storage.active)
+        if ((direction == UP ? up : down) && !IsFilling(direction))
         {
-            storage.level += static_cast<int64_t>(numPackets);
+            GetStorageLevel(direction).level += static_cast<int64_t>(numPackets);
         }
     }
     if (up && down)
@@ -629,10 +658,10 @@ SatelliteForwardingApp::ReplaceExpiredOwnCopy(SatPacketHeader& header)
     {
         return false;
     }
-    StorageLevel& storage = GetStorageLevel(direction);
-    if (storage.active)
+    // A filling queue fills the gap with new copies; otherwise the level makes room for them.
+    if (!IsFilling(direction))
     {
-        storage.level--;
+        GetStorageLevel(direction).level--;
     }
     return true;
 }
@@ -640,10 +669,10 @@ SatelliteForwardingApp::ReplaceExpiredOwnCopy(SatPacketHeader& header)
 bool
 SatelliteForwardingApp::CreateSecondCopy(direction_t direction, const SatPacketHeader& header, uint32_t epoch)
 {
-    // Once the level of a queue is active, its data only changes by admission
+    // Once a queue is no longer filling, its data only changes by admission
     // and deletion at the origin.
     Ptr<NetDevice> device = GetStorageDevice(direction);
-    if (IsInsertionBlocked(direction) || IsLevelActive(direction) || IsInSwitchGuard() || IsExpired(header) ||
+    if (IsInsertionBlocked(direction) || !IsFilling(direction) || IsInSwitchGuard() || IsExpired(header) ||
         GetQueueOccupancy(device) >= GetFillLevel())
     {
         return false;
@@ -700,11 +729,19 @@ SatelliteForwardingApp::TriggerRingDownSwitch()
     m_routing->InitiateRingDownSwitch();
 }
 
+void
+SatelliteForwardingApp::AddRingSwitchTime(direction_t ring, double time)
+{
+    m_switchTimes.push_back(time);
+    double& first = m_firstSwitchTime[ring == DOWN ? 1 : 0];
+    first = std::min(first, time);
+}
+
 bool
 SatelliteForwardingApp::IsInSwitchGuard() const
 {
     const double now = Simulator::Now().GetSeconds();
-    const double after = m_constellation.closedRing ? kSwitchGuardAfterClosedRing : kSwitchGuardAfter;
+    const double after = GetSwitchGuardAfter(m_constellation);
     for (double t : m_switchTimes)
     {
         if (now >= t - kSwitchGuardBefore && now <= t + after)

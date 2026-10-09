@@ -36,11 +36,11 @@
 //   A new ring satellite fills its new cross-plane queue with dummies, so that
 //   the new path has the same queueing delay as the old one. Every satellite
 //   tops its storage queues up to their levels before it enqueues a copy
-//   (SatelliteForwardingApp::RegulateStorageQueue), and a ring satellite
-//   between the seam orbits keeps its left queue at the ISL queue size
-//   (ForwardDown). This restores the drained down queues of the seam-right
-//   orbit after a DOWN switch and keeps the queues of all orbits equal from
-//   switch to switch.
+//   (SatelliteForwardingApp::RegulateStorageQueue; during the fill period only
+//   around a switch), and a ring satellite between the seam orbits keeps its
+//   left queue at the ISL queue size (ForwardDown). This restores the drained
+//   down queues of the seam-right orbit after a DOWN switch and keeps the
+//   queues of all orbits equal from switch to switch.
 //
 // Retired ring satellites (RouteUpNormal / RouteDownNormal)
 //   A satellite that is no longer a ring satellite can still receive copies on

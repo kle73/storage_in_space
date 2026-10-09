@@ -41,8 +41,9 @@
 //   (UP: role change, DOWN: first copy of a new epoch), so that the new ring
 //   ISL has the queueing delay of the old one. Every satellite tops its
 //   storage queues up to their levels before it enqueues a copy
-//   (SatelliteForwardingApp::RegulateStorageQueue): the old entries of a DOWN
-//   switch receive no copies for one lap and would drain otherwise.
+//   (SatelliteForwardingApp::RegulateStorageQueue; during the fill period only
+//   around a switch and at the kink exits): the old entries of a DOWN switch
+//   receive no copies for one lap and would drain otherwise.
 //
 // Stored copies (ReceiveUp / ReceiveDown)
 //   A copy that was inserted alone carries a flag; satellites that forward it

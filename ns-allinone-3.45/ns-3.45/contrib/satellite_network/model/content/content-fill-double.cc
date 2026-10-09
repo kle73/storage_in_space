@@ -19,9 +19,9 @@ namespace
 /// Objects are generated in random intervals of 2 to 12 us (one try per interval).
 constexpr int64_t kGenerationIntervalMinUs = 2;
 constexpr uint32_t kGenerationIntervalSpreadUs = 10;
-/// Polling intervals of the insertion [us]: next object; retry while the
-/// queues are filling; retry while the levels are exhausted or around a ring
-/// switch (the levels only change when copies are deleted).
+/// Polling intervals of the insertion [us]: next object; retry while a queue
+/// is filling; retry otherwise or around a ring switch (the levels then only
+/// change when copies are deleted).
 constexpr int64_t kInsertIntervalUs = 10;
 constexpr int64_t kRetryIntervalUs = 20;
 constexpr int64_t kIdleRetryIntervalUs = 1000;
@@ -109,8 +109,8 @@ ContentFillDouble::SendObject()
     }
     else if (!InsertObject(object))
     {
-        const bool levelsActive = m_app->IsLevelActive(UP) && m_app->IsLevelActive(DOWN);
-        Simulator::Schedule(MicroSeconds(levelsActive ? kIdleRetryIntervalUs : kRetryIntervalUs),
+        const bool filling = m_app->IsFilling(UP) || m_app->IsFilling(DOWN);
+        Simulator::Schedule(MicroSeconds(filling ? kRetryIntervalUs : kIdleRetryIntervalUs),
                             &ContentFillDouble::SendObject,
                             this);
         return;

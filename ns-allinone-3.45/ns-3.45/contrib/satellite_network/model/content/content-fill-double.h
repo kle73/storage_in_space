@@ -18,10 +18,11 @@ class SatPacketHeader;
  * times; they wait in a pending list until they can be stored. In STORAGE
  * mode every object is stored as two copies, an UP and a DOWN copy:
  *  - inserted into the UP and DOWN queue of the satellite whenever the storage
- *    levels admit it (SatelliteForwardingApp::AdmitObject). If only one of the
- *    two queues has room, that copy is inserted alone and flagged (dup code
- *    1), and the routing creates the second copy later at a satellite whose
- *    queue is still filling;
+ *    levels admit it (SatelliteForwardingApp::AdmitObject). While a queue is
+ *    still filling (fill period, see SatelliteForwardingApp) and only one of
+ *    the two queues has room, that copy is inserted alone and flagged (dup
+ *    code 1), and the routing creates the second copy later at a satellite
+ *    whose queue is still filling;
  *  - or copy by copy in place of expired copies of this satellite
  *    (TakeReplacementCopy), UP copies in place of UP copies and DOWN copies in
  *    place of DOWN copies.

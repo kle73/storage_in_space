@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -133,15 +134,31 @@ struct SatelliteForwardingAppParams
  * (UP copies) or of devDown (DOWN copies). Its level becomes active, at the
  * fill level, the first time the queue is full. From then on the routing tops
  * the queue up to the level with dummy packets before it enqueues a copy of
- * that direction, so that the queueing delay stays constant whatever the
- * amount of stored data. A copy whose time to live has expired is removed by
- * its origin when it passes there; if a new object is waiting, a copy of the
- * new object takes its place in the same stream (ReplaceExpiredOwnCopy).
- * Otherwise the level of the origin is lowered by one, which leaves room for
- * a new copy later; every copy stored through AdmitObject raises the level
- * again, and new copies are only admitted while the level is below the fill
- * level. Once all levels are active, the amount of stored data therefore
- * stays constant: expired copies are replaced by new ones, not by dummies.
+ * that direction (RegulateStorageQueue), so that the queueing delay stays
+ * constant whatever the amount of stored data.
+ *
+ * Fill period: a ring only reaches its full size at its first switch, which
+ * lengthens its cross-plane ISLs by as much as Doppler shortens them until the
+ * next switch. Until shortly after the first switch of its ring a storage
+ * queue is therefore still filling (IsFilling): gaps that drain it are not
+ * topped up with dummies, which would circulate around the ring for good, but
+ * filled with new copies, and copies may be stored alone (the routing creates
+ * the second copy where the other ring is still filling). Only around a ring
+ * switch and at satellites that may not insert copies are gaps topped up, so
+ * that they move on to the Doppler backlog or to a satellite that fills them.
+ * After the fill period every ring holds as much data as fits right after a
+ * switch, and the Doppler backlog between two switches drains at the next.
+ *
+ * Expired copies: a copy whose time to live has expired is removed by its
+ * origin when it passes there; if a new object is waiting, a copy of the new
+ * object takes its place in the same stream (ReplaceExpiredOwnCopy). Otherwise
+ * the copy is deleted. During the fill period the gap is filled like any
+ * other; afterwards the level of the origin is lowered by one, which leaves
+ * room for a new copy later. Every copy stored through AdmitObject after the
+ * fill period raises the level again, and new copies are only admitted while
+ * the level is below the fill level. After the fill period the amount of
+ * stored data therefore stays constant: expired copies are replaced by new
+ * ones, not by dummies.
  */
 class SatelliteForwardingApp : public Application
 {
@@ -226,12 +243,17 @@ class SatelliteForwardingApp : public Application
 
     // ── Storage levels ───────────────────────────────────────────────────────
     bool IsLevelActive(direction_t direction) const;
+    /// True while the storage queue of `direction` is filled up to the fill
+    /// level with new copies: before its level is active and during the fill
+    /// period of its ring (see the class description).
+    bool IsFilling(direction_t direction) const;
     /// Called by the routing before it enqueues a copy of `direction` into the
     /// storage queue of `direction`: activates the level once the queue is
-    /// full and tops the queue up to the level with dummies.
+    /// full and tops the queue up to the level with dummies, unless the queue
+    /// is filling and this satellite can fill it itself.
     void RegulateStorageQueue(direction_t direction);
     /// Decides which copies of a new object of `numPackets` packets may be
-    /// stored now and adds them to the levels. Once both levels are active,
+    /// stored now and adds them to the levels. Once neither queue is filling,
     /// objects are only stored complete.
     Admission AdmitObject(uint32_t numPackets);
     /// Handles a copy of this satellite whose time to live has expired (not
@@ -244,7 +266,8 @@ class SatelliteForwardingApp : public Application
     void SetReplacementSource(ReplacementSource source) { m_replacementSource = std::move(source); }
     /// A fragment that was stored as a single copy passes this satellite:
     /// stores the missing copy in `direction` with `epoch` if the storage queue
-    /// of `direction` is still filling. Returns true if the copy was created.
+    /// of `direction` is still filling and has room. Returns true if the copy
+    /// was created.
     bool CreateSecondCopy(direction_t direction, const SatPacketHeader& header, uint32_t epoch);
     /// True if the time to live of the packet has expired.
     static bool IsExpired(const SatPacketHeader& header);
@@ -265,9 +288,10 @@ class SatelliteForwardingApp : public Application
     void SetInsertionEpoch(direction_t direction, uint32_t epoch);
 
     // ── Ring switches ────────────────────────────────────────────────────────
-    /// Announces a ring switch at `time` [s] (RingSwitchScheduler, before the
-    /// simulation starts); used for the switch guard.
-    void AddRingSwitchTime(double time) { m_switchTimes.push_back(time); }
+    /// Announces a switch of the UP or DOWN `ring` at `time` [s]
+    /// (RingSwitchScheduler, before the simulation starts); used for the switch
+    /// guard and the fill period.
+    void AddRingSwitchTime(direction_t ring, double time);
     /// Called by RingSwitchScheduler on the satellite that starts a switch.
     void TriggerRingUpSwitch();
     void TriggerRingDownSwitch();
@@ -320,6 +344,9 @@ class SatelliteForwardingApp : public Application
     const StorageLevel& GetStorageLevel(direction_t direction) const;
     /// Activates the level of `direction` once no object fits into its queue.
     void ActivateLevelIfFull(direction_t direction);
+    /// True until shortly after the switch guard of the first switch of the
+    /// ring of `direction` (always if that ring never switches).
+    bool IsInFillPeriod(direction_t direction) const;
     /// Space for new copies in the storage queue of `direction` [packets].
     uint64_t GetStorageSpace(direction_t direction) const;
     void EvictExpiredRecords();
@@ -354,7 +381,9 @@ class SatelliteForwardingApp : public Application
     bool m_seamRight{false};
     bool m_insertionBlocked[2]{false, false};
     uint32_t m_insertionEpoch[2]{0, 0};
-    std::vector<double> m_switchTimes;
+    std::vector<double> m_switchTimes; ///< both rings
+    double m_firstSwitchTime[2]{std::numeric_limits<double>::infinity(),
+                                std::numeric_limits<double>::infinity()}; ///< UP, DOWN ring [s]
 
     // objects and own packets
     uint32_t m_objectSize{10};

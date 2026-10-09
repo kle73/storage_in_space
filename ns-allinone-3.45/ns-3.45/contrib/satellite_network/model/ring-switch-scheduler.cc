@@ -91,7 +91,7 @@ RingSwitchScheduler::ScheduleRing(Ring ring, double endTime)
         {
             if (app)
             {
-                app->AddRingSwitchTime(fireTime);
+                app->AddRingSwitchTime(ring == Ring::UP ? UP : DOWN, fireTime);
             }
         }
         step++;

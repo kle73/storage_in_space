@@ -171,11 +171,14 @@ Every object is stored as an UP and a DOWN copy that circulate in the storage
 rings. Each satellite has a level for its up queue and its down queue: the
 level becomes active the first time the queue is full, and from then on the
 routing tops the queue up to its level with dummy packets (they only add
-queueing delay and are dropped by the next satellite). New objects are stored
-whenever the levels admit them and no ring switch is near; a copy whose time to
-live (`--ttl`) has expired is replaced by a copy of a waiting object, or
-deleted, by its origin. The stored amount therefore stays constant once all
-levels are active. Details: class comment of `SatelliteForwardingApp` and the
+queueing delay and are dropped by the next satellite). Until shortly after the
+first switch of a ring (fill period), gaps in its queues are filled with new
+objects instead, so that the ring holds as much data as fits right after a
+switch; only around a switch are they topped up with dummies. New objects are
+stored whenever the levels admit them and no ring switch is near; a copy whose
+time to live (`--ttl`) has expired is replaced by a copy of a waiting object,
+or deleted, by its origin. The stored amount therefore stays constant after
+the fill period. Details: class comment of `SatelliteForwardingApp` and the
 overview comments at the top of the two routing files.
 
 There are no compile-time switches. Tuning constants (queue headroom, switch
